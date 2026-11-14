@@ -9,7 +9,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include "ac_xclipse_log.h"
 
 #include "tools/radv_debug.h"
@@ -126,12 +128,113 @@ radv_xclipse_bo_churn(struct radv_amdgpu_winsys *ws, uint64_t size, bool created
                        radv_xclipse_bo_hist_name[7], radv_xclipse_bo_hist[7]);
 }
 
-/* Memory guard: the sgpu kernel hard-locks the phone when GPU-pinned GTT across all processes
- * reaches ~9-10GB (vendor ICD too). Allocations of 2 MB or more fail with OUT_OF_DEVICE_MEMORY
- * once the total would pass the advertised 8 GB heap. Usage comes from mem_info_gtt_used, or a
- * process-local total if that is unreadable. Heap sizes stay honest. */
-#define XCLIPSE_MEMGUARD_SYSFS "/sys/devices/platform/16e00000.sgpu/mem_info_gtt_used"
+/* Memory guard: the sgpu kernel hard-locks when GPU-pinned GTT reaches ~9-10 GB, and on 8 GB
+ * devices Android's lmkd SIGKILLs the foreground Wine/DXVK process once unswappable GTT + Wine
+ * pages push MemFree below the min2x watermark. On <= 8 GB phones, step DXVK's VkDeviceMemory
+ * slab size down progressively from >= 32 MB (so DXVK runs freeEmptyChunks() from startup instead
+ * of pinning 64-128 MB slabs) based on process-local GTT and DRM system GTT (never MemAvailable,
+ * which kswapd keeps near ~900 MB while swapping cold pages to zram). */
 #define XCLIPSE_MEMGUARD_LIMIT (8192ull << 20)
+
+static inline bool
+xclipse_would_exceed(uint64_t used, uint64_t size, uint64_t limit)
+{
+   return size > limit || used > limit - size;
+}
+
+static uint64_t
+xclipse_memguard_override_bytes(void)
+{
+   static uint64_t cached = UINT64_MAX;
+   uint64_t v = p_atomic_read(&cached);
+   if (v != UINT64_MAX)
+      return v;
+
+   uint64_t bytes = 0;
+   const char *e = getenv("RADV_XCLIPSE_MEMGUARD_MB");
+   if (e && e[0]) {
+      uint64_t mb = strtoull(e, NULL, 10);
+      if (mb > 0)
+         bytes = mb << 20;
+   }
+#ifdef __ANDROID__
+   if (!bytes) {
+      char pbuf[PROP_VALUE_MAX] = {0};
+      if (__system_property_get("debug.radv_xclipse_memguard_mb", pbuf) > 0 && pbuf[0]) {
+         uint64_t mb = strtoull(pbuf, NULL, 10);
+         if (mb > 0)
+            bytes = mb << 20;
+      }
+   }
+#endif
+   p_atomic_set(&cached, bytes);
+   return bytes;
+}
+
+static void
+xclipse_memguard_sample(struct radv_amdgpu_winsys *ws, uint64_t local_used,
+                        uint64_t *mem_total_out, uint64_t *mem_avail_out, uint64_t *sys_used_out)
+{
+   static int64_t cached_at;
+   static uint64_t cached_total;
+   static uint64_t cached_avail;
+   static uint64_t cached_other_gtt;
+   static struct radv_amdgpu_winsys *cached_ws;
+
+   const int64_t now = os_time_get_nano();
+   const int64_t last = p_atomic_read(&cached_at);
+   const int64_t age = now - last;
+   if (last && age >= 0 && age < 200000000ll && p_atomic_read(&cached_ws) == ws) {
+      *mem_total_out = p_atomic_read(&cached_total);
+      *mem_avail_out = p_atomic_read(&cached_avail);
+      *sys_used_out = local_used + p_atomic_read(&cached_other_gtt);
+      return;
+   }
+
+   uint64_t total = p_atomic_read(&cached_total);
+   uint64_t avail = 0;
+   int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+      char buf[2048];
+      ssize_t n = read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      if (n > 0) {
+         buf[n] = '\0';
+         if (!total) {
+            const char *pt = strstr(buf, "MemTotal:");
+            if (pt) {
+               pt += strlen("MemTotal:");
+               total = (uint64_t)strtoull(pt, NULL, 10) * 1024ull;
+            }
+         }
+         const char *pa = strstr(buf, "MemAvailable:");
+         if (pa) {
+            pa += strlen("MemAvailable:");
+            avail = (uint64_t)strtoull(pa, NULL, 10) * 1024ull;
+         }
+      }
+   }
+
+   uint64_t other_gtt = 0;
+   if (ws && ws->dev) {
+      struct amdgpu_heap_info heap = {0};
+      if (ac_drm_query_heap_info(ws->dev, AMDGPU_GEM_DOMAIN_GTT, 0, &heap) == 0 &&
+          heap.heap_usage > local_used) {
+         other_gtt = heap.heap_usage - local_used;
+      }
+   }
+
+   if (total)
+      p_atomic_set(&cached_total, total);
+   p_atomic_set(&cached_avail, avail);
+   p_atomic_set(&cached_other_gtt, other_gtt);
+   p_atomic_set(&cached_ws, ws);
+   p_atomic_set(&cached_at, now);
+
+   *mem_total_out = total;
+   *mem_avail_out = avail;
+   *sys_used_out = local_used + other_gtt;
+}
 
 static bool
 xclipse_memguard_reject(struct radv_amdgpu_winsys *ws, uint64_t size)
@@ -139,26 +242,65 @@ xclipse_memguard_reject(struct radv_amdgpu_winsys *ws, uint64_t size)
    if (!ws->info.gfx11_shader_core || size < (2ull << 20))
       return false;
 
-   static int sysfs_ok = -1;
-   uint64_t used = 0;
-   if (sysfs_ok != 0) {
-      FILE *f = fopen(XCLIPSE_MEMGUARD_SYSFS, "r");
-      if (f) {
-         sysfs_ok = fscanf(f, "%" PRIu64, &used) == 1;
-         fclose(f);
-      } else {
-         sysfs_ok = 0;
-      }
-   }
-   if (sysfs_ok != 1)
-      used = p_atomic_read(&ws->alloc_tracker->allocated_gtt);
+   const uint64_t local_used = (uint64_t)p_atomic_read(&ws->alloc_tracker->allocated_gtt);
+   uint64_t mem_total = 0, mem_avail = 0, sys_used = local_used;
+   xclipse_memguard_sample(ws, local_used, &mem_total, &mem_avail, &sys_used);
 
-   if (used + size > XCLIPSE_MEMGUARD_LIMIT) {
-      radv_log_msg("[MEMGUARD] REJECT alloc %" PRIu64 "MB: gtt_used=%" PRIu64 "MB limit=%" PRIu64 "MB (src=%s)",
-                   size >> 20, used >> 20, XCLIPSE_MEMGUARD_LIMIT >> 20, sysfs_ok == 1 ? "sysfs" : "local");
-      return true;
+   const bool is_8gb = mem_total > 0 && mem_total <= (8500ull << 20);
+   const uint64_t override_bytes = xclipse_memguard_override_bytes();
+   uint64_t local_hard = is_8gb ? (1536ull << 20) : XCLIPSE_MEMGUARD_LIMIT;
+   uint64_t sys_hard = is_8gb ? (1920ull << 20) : XCLIPSE_MEMGUARD_LIMIT;
+   if (override_bytes) {
+      local_hard = MIN2(override_bytes, XCLIPSE_MEMGUARD_LIMIT);
+      sys_hard = is_8gb ? (local_hard + (384ull << 20)) : local_hard;
    }
-   return false;
+
+   const char *reason = NULL;
+   uint64_t local_lim = local_hard;
+   uint64_t sys_lim = sys_hard;
+
+   if (is_8gb) {
+      const bool soft_ramp = !override_bytes;
+      const struct {
+         uint64_t min_size;
+         uint64_t local;
+         uint64_t sys;
+         const char *name;
+      } tiers[] = {
+         {64ull << 20, soft_ramp ? 0 : local_hard, soft_ramp ? 0 : sys_hard, "soft64M"},
+         {32ull << 20, local_hard, sys_hard, "soft32M"},
+         {2ull << 20, local_hard + (128ull << 20), sys_hard + (128ull << 20), "hard"},
+      };
+
+      for (unsigned i = 0; i < ARRAY_SIZE(tiers); i++) {
+         if (size < tiers[i].min_size)
+            continue;
+         if (xclipse_would_exceed(local_used, size, tiers[i].local) ||
+             xclipse_would_exceed(sys_used, size, tiers[i].sys)) {
+            reason = tiers[i].name;
+            local_lim = tiers[i].local;
+            sys_lim = tiers[i].sys;
+            break;
+         }
+      }
+   } else if (xclipse_would_exceed(local_used, size, local_hard) ||
+              xclipse_would_exceed(sys_used, size, sys_hard)) {
+      reason = "hard";
+   }
+
+   if (!reason)
+      return false;
+
+   static uint32_t reject_cnt;
+   uint32_t n = p_atomic_inc_return(&reject_cnt);
+   if (n == 1 || (n & 0xff) == 0) {
+      AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_CHURN",
+                      "[MEMGUARD] REJECT(%s #%u) alloc=%" PRIu64 "MB local=%" PRIu64 "/%" PRIu64
+                      "MB sys=%" PRIu64 "/%" PRIu64 "MB avail=%" PRIu64 "MB",
+                      reason, n, size >> 20, local_used >> 20, local_lim >> 20, sys_used >> 20,
+                      sys_lim >> 20, mem_avail >> 20);
+   }
+   return true;
 }
 
 /* Winsys-local bo_flags bit (never leaves this file): PAL-style VA map, R|W|X and no MTYPE (0xe).

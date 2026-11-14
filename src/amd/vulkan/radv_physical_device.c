@@ -28,6 +28,7 @@
 #include "tools/radv_debug.h"
 #include "util/disk_cache.h"
 #include "util/hex.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "radv_android.h"
 #include "radv_device.h"
@@ -103,21 +104,54 @@ radv_xclipse_flag_off(const char *env, const char *prop)
    return false;
 }
 
-/* Allocatable system memory from /proc/meminfo MemAvailable; 0 if unavailable (callers must treat
- * 0 as "don't clamp"). Queried per frame, possibly from a thread the GPU waits on: raw
- * open/read/close, no stdio or malloc, cached ~500ms. */
+/* Positive-or-zero MB knob helper: env var first, then Android property. */
 static uint64_t
-radv_xclipse_mem_available_bytes(void)
+radv_xclipse_mb_knob(const char *env, const char *prop, uint64_t def_mb, bool allow_zero)
 {
-   static uint64_t cached_bytes;
+   const char *e = getenv(env);
+   if (e && e[0]) {
+      char *end = NULL;
+      uint64_t mb = strtoull(e, &end, 10);
+      if (end != e && (mb > 0 || allow_zero))
+         return mb << 20;
+   }
+#if DETECT_OS_ANDROID
+   char val[PROP_VALUE_MAX] = {0};
+   if (__system_property_get(prop, val) > 0 && val[0]) {
+      char *end = NULL;
+      uint64_t mb = strtoull(val, &end, 10);
+      if (end != val && (mb > 0 || allow_zero))
+         return mb << 20;
+   }
+#else
+   (void)prop;
+#endif
+   return def_mb << 20;
+}
+
+/* System memory totals from /proc/meminfo (MemAvailable + MemTotal); 0 if unavailable. Queried per
+ * frame, possibly from a thread the GPU waits on: raw open/read/close, no stdio or malloc, cached
+ * ~500ms. */
+static void
+radv_xclipse_mem_info(uint64_t *avail_out, uint64_t *total_out)
+{
+   static uint64_t cached_avail;
+   static uint64_t cached_total;
    static int64_t cached_at;
 
    const int64_t now = os_time_get_nano();
-   const int64_t age = now - cached_at;
-   if (cached_at && age >= 0 && age < 500000000ll)
-      return cached_bytes;
+   const int64_t last = p_atomic_read(&cached_at);
+   const int64_t age = now - last;
+   if (last && age >= 0 && age < 500000000ll) {
+      if (avail_out)
+         *avail_out = p_atomic_read(&cached_avail);
+      if (total_out)
+         *total_out = p_atomic_read(&cached_total);
+      return;
+   }
 
-   uint64_t out = 0;
+   uint64_t avail = 0;
+   uint64_t total = p_atomic_read(&cached_total);
    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
    if (fd >= 0) {
       char buf[2048];
@@ -125,17 +159,29 @@ radv_xclipse_mem_available_bytes(void)
       close(fd);
       if (n > 0) {
          buf[n] = '\0';
-         const char *p = strstr(buf, "MemAvailable:");
-         if (p) {
-            p += strlen("MemAvailable:");
-            out = (uint64_t)strtoull(p, NULL, 10) * 1024ull; /* the field is in kB */
+         if (!total) {
+            const char *pt = strstr(buf, "MemTotal:");
+            if (pt) {
+               pt += strlen("MemTotal:");
+               total = (uint64_t)strtoull(pt, NULL, 10) * 1024ull; /* the field is in kB */
+            }
+         }
+         const char *pa = strstr(buf, "MemAvailable:");
+         if (pa) {
+            pa += strlen("MemAvailable:");
+            avail = (uint64_t)strtoull(pa, NULL, 10) * 1024ull; /* the field is in kB */
          }
       }
    }
 
-   cached_bytes = out;
-   cached_at = now;
-   return out;
+   p_atomic_set(&cached_avail, avail);
+   if (total)
+      p_atomic_set(&cached_total, total);
+   p_atomic_set(&cached_at, now);
+   if (avail_out)
+      *avail_out = avail;
+   if (total_out)
+      *total_out = total;
 }
 
 static bool
@@ -3838,14 +3884,28 @@ radv_get_memory_budget_properties(VkPhysicalDevice physicalDevice,
    }
 
    /* Honest budget. has_dedicated_vram is true on this APU, so the discrete branch reports
-    * heap_size - usage and ignores system memory (budget 7432MB with 3.5GB MemAvailable). Clamp the
-    * budget to real available memory. Never clamp the heap size: that hard-crashed the phone. */
-   const uint64_t avail = radv_xclipse_mem_available_bytes();
+    * heap_size - usage and ignores system memory. On <= 8 GB phones, Android's MemAvailable
+    * includes ~1.2 GB of mapped file cache that lmkd will not drop before killing the foreground
+    * app, so deduct a safety reserve and cap the per-process GTT budget to force DXVK/Unity slab
+    * reclamation before hitting lmkd. Never clamp the heap size: that hard-crashed the phone. */
+   uint64_t avail = 0, total = 0;
+   radv_xclipse_mem_info(&avail, &total);
    if (avail) {
+      const bool is_8gb = total > 0 && total <= (8500ull << 20);
+      const uint64_t reserve =
+         radv_xclipse_mb_knob("RADV_XCLIPSE_MEM_RESERVE_MB", "debug.radv_xclipse_mem_reserve_mb",
+                              is_8gb ? 1280ull : 0ull, true);
+      const uint64_t gtt_cap =
+         radv_xclipse_mb_knob("RADV_XCLIPSE_GTT_LIMIT_MB", "debug.radv_xclipse_gtt_limit_mb",
+                              is_8gb ? 1344ull : 4096ull, false);
+      const uint64_t usable_avail = avail > reserve ? avail - reserve : 0;
+
       for (uint32_t i = 0; i < memory_properties->memoryHeapCount; i++) {
-         /* Never below what this process already holds (negative headroom). */
-         const uint64_t floor_b = memoryBudget->heapUsage[i];
-         const uint64_t honest = MAX2(avail + floor_b, floor_b);
+         if ((int)i == pdev->xclipse_pal_heap_index)
+            continue;
+
+         uint64_t honest = MIN2(memoryBudget->heapUsage[i] + usable_avail, gtt_cap);
+         honest = MAX2(honest, 512ull << 20);
          memoryBudget->heapBudget[i] = MIN2(memoryBudget->heapBudget[i], honest);
       }
    }
