@@ -2310,6 +2310,7 @@ struct DeviceInfo {
    bool no_delay_alu = false;
    bool no_permlane64 = false;
    bool ldsdir_valu_drain = false;
+   bool ldsdir_hazard_drain = false;
 
    int32_t scratch_global_offset_min;
    int32_t scratch_global_offset_max;

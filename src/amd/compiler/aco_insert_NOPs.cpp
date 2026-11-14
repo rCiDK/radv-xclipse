@@ -1185,6 +1185,7 @@ test_vgpr_bitset(std::bitset<256>& set, Operand op)
 struct LdsDirectVALUHazardGlobalState {
    unsigned wait_vdst = 15;
    PhysReg vgpr;
+   bool drain_on_hazard = false;
    std::set<unsigned> loop_headers_visited;
 };
 
@@ -1212,9 +1213,11 @@ handle_lds_direct_valu_hazard_instr(LdsDirectVALUHazardGlobalState& global_state
             !op.isConstant() && regs_intersect(op.physReg(), op.size(), global_state.vgpr, 1);
       }
       if (uses_vgpr) {
-         /* Transcendentals execute in parallel to other VALU and va_vdst count becomes unusable */
+         /* Transcendentals execute in parallel to other VALU and va_vdst count becomes unusable.
+          * On Xclipse 940 (ldsdir_hazard_drain), drain VALU when a prior VALU touched vgpr. */
          global_state.wait_vdst =
-            MIN2(global_state.wait_vdst, block_state.has_trans ? 0 : block_state.num_valu);
+            MIN2(global_state.wait_vdst,
+                 (block_state.has_trans || global_state.drain_on_hazard) ? 0 : block_state.num_valu);
          return true;
       }
 
@@ -1228,7 +1231,8 @@ handle_lds_direct_valu_hazard_instr(LdsDirectVALUHazardGlobalState& global_state
    if (block_state.num_instrs > 256 || block_state.num_blocks > 32) {
       /* Exit to limit compile times and set wait_vdst to be safe. */
       global_state.wait_vdst =
-         MIN2(global_state.wait_vdst, block_state.has_trans ? 0 : block_state.num_valu);
+         MIN2(global_state.wait_vdst,
+              (block_state.has_trans || global_state.drain_on_hazard) ? 0 : block_state.num_valu);
       return true;
    }
 
@@ -1262,6 +1266,7 @@ handle_lds_direct_valu_hazard(State& state, aco_ptr<Instruction>& instr)
    LdsDirectVALUHazardGlobalState global_state;
    global_state.wait_vdst = instr->ldsdir().wait_vdst;
    global_state.vgpr = instr->definitions[0].physReg();
+   global_state.drain_on_hazard = state.program->dev.ldsdir_hazard_drain;
    LdsDirectVALUHazardBlockState block_state;
    search_backwards<LdsDirectVALUHazardGlobalState, LdsDirectVALUHazardBlockState,
                     &handle_lds_direct_valu_hazard_block, &handle_lds_direct_valu_hazard_instr>(

@@ -492,6 +492,93 @@ radv_xclipse_f2f16_rtz(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+struct radv_xclipse_aco_cfg {
+   int8_t delay_alu;
+   int8_t permlane64;
+   int8_t ldsdir_drain; /* 0 = off, 1 = full drain, 2 = hazard drain */
+   int8_t offsets13;
+   int8_t swizzle_idxen;
+   int8_t scratch_init;
+   int8_t dealloc_vgprs;
+   int8_t f2f16_rtz;
+   char raw[96];
+};
+
+static const struct radv_xclipse_aco_cfg *
+radv_xclipse_aco_overrides(void)
+{
+   static struct radv_xclipse_aco_cfg cfg;
+   static int inited = 0;
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+
+   if (p_atomic_read(&inited))
+      return &cfg;
+
+   simple_mtx_lock(&lock);
+   if (!p_atomic_read(&inited)) {
+      cfg.delay_alu = -1;
+      cfg.permlane64 = -1;
+      cfg.ldsdir_drain = -1;
+      cfg.offsets13 = -1;
+      cfg.swizzle_idxen = -1;
+      cfg.scratch_init = -1;
+      cfg.dealloc_vgprs = -1;
+      cfg.f2f16_rtz = -1;
+
+      const char *s = getenv("RADV_XCLIPSE_ACO");
+#if DETECT_OS_ANDROID
+      char prop[PROP_VALUE_MAX] = {0};
+      if (!(s && s[0]) && __system_property_get("debug.radv_xclipse_aco", prop) > 0)
+         s = prop;
+#endif
+      if (s && s[0]) {
+         snprintf(cfg.raw, sizeof(cfg.raw), "%s", s);
+         char buf[sizeof(cfg.raw)];
+         snprintf(buf, sizeof(buf), "%s", s);
+         char *save = NULL;
+         for (char *tok = strtok_r(buf, ", \t", &save); tok; tok = strtok_r(NULL, ", \t", &save)) {
+            if (!strcmp(tok, "delay_alu"))
+               cfg.delay_alu = 1;
+            else if (!strcmp(tok, "no_delay_alu"))
+               cfg.delay_alu = 0;
+            else if (!strcmp(tok, "permlane64"))
+               cfg.permlane64 = 1;
+            else if (!strcmp(tok, "no_permlane64"))
+               cfg.permlane64 = 0;
+            else if (!strcmp(tok, "ldsdir_drain"))
+               cfg.ldsdir_drain = 1;
+            else if (!strcmp(tok, "ldsdir_hazard"))
+               cfg.ldsdir_drain = 2;
+            else if (!strcmp(tok, "no_ldsdir_drain"))
+               cfg.ldsdir_drain = 0;
+            else if (!strcmp(tok, "offsets13"))
+               cfg.offsets13 = 1;
+            else if (!strcmp(tok, "gfx10_offsets"))
+               cfg.offsets13 = 0;
+            else if (!strcmp(tok, "swizzle_idxen"))
+               cfg.swizzle_idxen = 1;
+            else if (!strcmp(tok, "no_swizzle_idxen"))
+               cfg.swizzle_idxen = 0;
+            else if (!strcmp(tok, "scratch_init"))
+               cfg.scratch_init = 1;
+            else if (!strcmp(tok, "no_scratch_init"))
+               cfg.scratch_init = 0;
+            else if (!strcmp(tok, "dealloc_vgprs"))
+               cfg.dealloc_vgprs = 1;
+            else if (!strcmp(tok, "no_dealloc_vgprs"))
+               cfg.dealloc_vgprs = 0;
+            else if (!strcmp(tok, "f2f16_rtz"))
+               cfg.f2f16_rtz = 1;
+            else if (!strcmp(tok, "no_f2f16_rtz"))
+               cfg.f2f16_rtz = 0;
+         }
+      }
+      p_atomic_set(&inited, 1);
+   }
+   simple_mtx_unlock(&lock);
+   return &cfg;
+}
+
 nir_shader *
 radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct radv_shader_stage *stage,
                          const struct radv_spirv_to_nir_options *options, bool is_internal)
@@ -863,7 +950,10 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct 
     * range into inf, which then spreads as inf/NaN. Conversions without an explicit RTE execution
     * mode get the vendor's rounding. RADV's own shaders keep RTE. From paulowesll/mesa
     * b393e1d6d8. */
-   if (compiler_info->hw.gfx11_isa && !is_meta_shader(nir) &&
+   const struct radv_xclipse_aco_cfg *aco_cfg =
+      compiler_info->hw.gfx11_isa ? radv_xclipse_aco_overrides() : NULL;
+   const bool f2f16_rtz = aco_cfg && (aco_cfg->f2f16_rtz >= 0 ? aco_cfg->f2f16_rtz : true);
+   if (f2f16_rtz && !is_meta_shader(nir) &&
        !nir_is_rounding_mode_rtne(nir->info.float_controls_execution_mode, 16))
       NIR_PASS(_, nir, nir_shader_alu_pass, radv_xclipse_f2f16_rtz, nir_metadata_control_flow, NULL);
 
@@ -3653,29 +3743,77 @@ radv_aco_fill_compiler_options(struct aco_compiler_options *aco_info, const stru
 
    /* Only the ISA is GFX11: state and register emission stay at gfx_level, and RDNA3-only hardware
     * features (dual-issue VALU) stay off. */
-   if (compiler_info->hw.gfx11_isa)
+   if (compiler_info->hw.gfx11_isa) {
+      const struct radv_xclipse_aco_cfg *cfg = radv_xclipse_aco_overrides();
+      const bool titan = compiler_info->hw.hw_scratch_base;
+
       aco_info->gfx_level = GFX11;
-   aco_info->has_vopd = aco_info->gfx_level >= GFX11 && !compiler_info->hw.gfx11_isa;
-   aco_info->no_delay_alu = compiler_info->hw.gfx11_isa;
-   aco_info->no_permlane64 = compiler_info->hw.gfx11_isa;
-   aco_info->ldsdir_valu_drain = compiler_info->hw.gfx11_isa;
-   aco_info->gfx10_global_offsets = compiler_info->hw.gfx11_isa;
-   aco_info->swizzle_no_idxen = compiler_info->hw.gfx11_isa;
+      aco_info->has_vopd = false;
+      aco_info->no_delay_alu = cfg->delay_alu >= 0 ? !cfg->delay_alu : true;
+      aco_info->no_permlane64 = cfg->permlane64 >= 0 ? !cfg->permlane64 : true;
+      if (cfg->ldsdir_drain == 0) {
+         aco_info->ldsdir_valu_drain = false;
+         aco_info->ldsdir_hazard_drain = false;
+      } else if (cfg->ldsdir_drain == 1) {
+         aco_info->ldsdir_valu_drain = true;
+         aco_info->ldsdir_hazard_drain = false;
+      } else if (cfg->ldsdir_drain == 2) {
+         aco_info->ldsdir_valu_drain = false;
+         aco_info->ldsdir_hazard_drain = true;
+      } else {
+         aco_info->ldsdir_valu_drain = !titan;
+         aco_info->ldsdir_hazard_drain = titan;
+      }
+      aco_info->gfx10_global_offsets = cfg->offsets13 >= 0 ? !cfg->offsets13 : true;
+      aco_info->swizzle_no_idxen = cfg->swizzle_idxen >= 0 ? !cfg->swizzle_idxen : true;
+      aco_info->gfx10_export_encoding = true;
+      aco_info->gfx10_4_fmask = !titan;
+      aco_info->gfx10_sendmsg = cfg->dealloc_vgprs >= 0 ? !cfg->dealloc_vgprs : true;
+      aco_info->gfx10_nsa = !titan;
+
+      /* The 920's command processor never sets FLAT_SCRATCH, so the shader does (GFX10.3 style). The
+       * 530 and 940 set it in hardware from the dispatch scratch base, as GFX11 does, and the vendor
+       * relies on that; there the GFX10.3 init read a wave offset the hardware does not provide and
+       * every scratch access faulted (scratchprobe: all lanes untouched, 2026-10-11).
+       * RADV_XCLIPSE_SCRATCHINIT=0/1 or RADV_XCLIPSE_ACO=[no_]scratch_init overrides for A/B. */
+      static int scratch_init = -2;
+      if (scratch_init == -2) {
+         const char *e = getenv("RADV_XCLIPSE_SCRATCHINIT");
+         scratch_init = e && e[0] ? atoi(e) != 0 : -1;
+      }
+      aco_info->gfx10_scratch_init =
+         scratch_init >= 0 ? scratch_init : (cfg->scratch_init >= 0 ? cfg->scratch_init : !titan);
+
+#if defined(__ANDROID__) || defined(__linux__)
+      static int logged = 0;
+      if (p_atomic_read(&logged) == 0 && ac_xclipse_log_level() >= 1 && p_atomic_cmpxchg(&logged, 0, 1) == 0) {
+         const char *lds =
+            aco_info->ldsdir_valu_drain ? "drain" : (aco_info->ldsdir_hazard_drain ? "hazard" : "off");
+         AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM",
+                         "[ACO] titan=%d delay_alu=%d permlane64=%d ldsdir=%s offsets13=%d "
+                         "swizzle_idxen=%d scratch_init=%d dealloc_vgprs=%d f2f16_rtz=%d raw=\"%s\"",
+                         titan ? 1 : 0, !aco_info->no_delay_alu, !aco_info->no_permlane64, lds,
+                         !aco_info->gfx10_global_offsets, !aco_info->swizzle_no_idxen,
+                         aco_info->gfx10_scratch_init, !aco_info->gfx10_sendmsg,
+                         cfg->f2f16_rtz >= 0 ? cfg->f2f16_rtz : 1, cfg->raw[0] ? cfg->raw : "default");
+      }
+#endif
+   } else {
+      aco_info->has_vopd = aco_info->gfx_level >= GFX11;
+      aco_info->no_delay_alu = false;
+      aco_info->no_permlane64 = false;
+      aco_info->ldsdir_valu_drain = false;
+      aco_info->ldsdir_hazard_drain = false;
+      aco_info->gfx10_global_offsets = false;
+      aco_info->swizzle_no_idxen = false;
+      aco_info->gfx10_scratch_init = false;
+      aco_info->gfx10_export_encoding = false;
+      aco_info->gfx10_4_fmask = false;
+      aco_info->gfx10_sendmsg = false;
+      aco_info->gfx10_nsa = false;
+   }
    /* Set per shader in shader_compile(): RADV's own shaders only. */
    aco_info->device_scope_dlc = false;
-   /* The 920's command processor never sets FLAT_SCRATCH, so the shader does (GFX10.3 style). The
-    * 530 and 940 set it in hardware from the dispatch scratch base, as GFX11 does, and the vendor
-    * relies on that; there the GFX10.3 init read a wave offset the hardware does not provide and
-    * every scratch access faulted (scratchprobe: all lanes untouched, 2026-10-11).
-    * RADV_XCLIPSE_SCRATCHINIT=0/1 overrides, for A/B only (an env var, so it is part of the shader
-    * cache key). */
-   static int scratch_init = -2;
-   if (scratch_init == -2) {
-      const char *e = getenv("RADV_XCLIPSE_SCRATCHINIT");
-      scratch_init = e && e[0] ? atoi(e) != 0 : -1;
-   }
-   aco_info->gfx10_scratch_init =
-      compiler_info->hw.gfx11_isa && (scratch_init >= 0 ? scratch_init : !compiler_info->hw.hw_scratch_base);
 }
 
 void
@@ -3692,18 +3830,17 @@ radv_set_stage_key_robustness(const struct vk_pipeline_robustness_state *rs, mes
       key->vertex_robustness1 = 1u;
 }
 
-/* Xclipse (gfx11_isa): in wave64, ACO moves data between the two 32-lane halves with
- * v_permlane64_b32, which only RDNA3 hardware has. On the 920 the other half reads back 0
- * (probe/gfx/rt/sgprobe). That path is taken by shuffle, read_invocation with an index that is
- * not a constant, and rotate. Log each wave64 shader that has them (diagnostic level 1), so a
- * field capture says whether an app reaches it. */
+/* Xclipse (gfx11_isa): in wave64, ACO normally moves data between the two 32-lane halves with
+ * v_permlane64_b32, which is missing/broken on Xclipse, so no_permlane64 emulates shuffles and
+ * full-wave rotates via per-lane readlane. Log wave64 shaders that hit shuffle/rotate so a field
+ * capture shows whether an app reaches them and which lowering path is active. */
 static void
 radv_xclipse_log_wave64_crosslane(struct nir_shader *const *shaders, int shader_count)
 {
 #ifdef __ANDROID__
    if (ac_xclipse_log_level() < 1)
       return;
-   unsigned shuffles = 0, reads = 0, rotates = 0;
+   unsigned shuffles = 0, rotates = 0;
    for (int i = 0; i < shader_count; i++) {
       nir_foreach_function_impl (impl, shaders[i]) {
          nir_foreach_block (block, impl) {
@@ -3718,10 +3855,6 @@ radv_xclipse_log_wave64_crosslane(struct nir_shader *const *shaders, int shader_
                case nir_intrinsic_shuffle_down:
                   shuffles++;
                   break;
-               case nir_intrinsic_read_invocation:
-                  if (!nir_src_is_const(intr->src[1]))
-                     reads++;
-                  break;
                case nir_intrinsic_rotate:
                   rotates++;
                   break;
@@ -3732,13 +3865,17 @@ radv_xclipse_log_wave64_crosslane(struct nir_shader *const *shaders, int shader_
          }
       }
    }
-   if (shuffles + reads + rotates) {
+   if (shuffles + rotates) {
+      const struct radv_xclipse_aco_cfg *cfg = radv_xclipse_aco_overrides();
+      const bool no_permlane64 = cfg->permlane64 >= 0 ? !cfg->permlane64 : true;
       const struct nir_shader *s = shaders[shader_count - 1];
-      AC_XCLIPSE_LOGP(ANDROID_LOG_WARN, "RADV_ARM",
-                      "[W64XLANE] %s wave64 shader uses cross-half lane ops (broken on this chip): shuffle %u "
-                      "read_invocation %u rotate %u  block %ux%ux%u  name %s",
-                      mesa_shader_stage_name(s->info.stage), shuffles, reads, rotates, s->info.workgroup_size[0],
-                      s->info.workgroup_size[1], s->info.workgroup_size[2], s->info.name ? s->info.name : "-");
+      AC_XCLIPSE_LOGP(no_permlane64 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, "RADV_ARM",
+                      "[W64XLANE] %s wave64 shader uses cross-half lane ops (%s): shuffle %u "
+                      "rotate %u  block %ux%ux%u  name %s",
+                      mesa_shader_stage_name(s->info.stage),
+                      no_permlane64 ? "emulated via readlane" : "v_permlane64_b32", shuffles, rotates,
+                      s->info.workgroup_size[0], s->info.workgroup_size[1], s->info.workgroup_size[2],
+                      s->info.name ? s->info.name : "-");
    }
 #endif
 }

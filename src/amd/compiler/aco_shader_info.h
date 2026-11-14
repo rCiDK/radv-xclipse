@@ -175,6 +175,10 @@ struct aco_compiler_options {
     * (paulowesll/mesa a0191be5f8: a flat input returned a v_min3_f32 result issued 7 VALUs
     * earlier). */
    bool ldsdir_valu_drain;
+   /* Wait for all outstanding VALU (wait_vdst 0) only when LdsDirectVALUHazard finds an earlier
+    * VALU reference to the destination VGPR or hits its search limit, keeping wait_vdst=15 when no
+    * VALU hazard exists (Xclipse 940 / CHIP_TITAN). */
+   bool ldsdir_hazard_drain;
    /* Global/scratch immediate offsets are 12-bit signed (-2048..2047) as on RDNA2, although the
     * GFX11 encoding has a 13-bit field. Measured on the Xclipse 920 (probe/gfx/rt/goffprobe): a
     * global access at +2800 or +4092 lands 4 KiB low. */
@@ -195,6 +199,14 @@ struct aco_compiler_options {
     * does, so without this every scratch access faults until the kernel's 5 s job timeout
     * (probe/gfx/rt/scratchprobe). */
    bool gfx10_scratch_init;
+   /* GFX11 ISA with GFX10.3 SX/CB export encoding (VM/COMPR instead of ROW_EN). */
+   bool gfx10_export_encoding;
+   /* Xclipse 920 (GFX10_4): FMASK via color T# (2D_MSAA image_load dmask:1). */
+   bool gfx10_4_fmask;
+   /* GFX10.3 SPI/message bus: s_sendmsg imm 3 is GS_DONE, not RDNA3 dealloc_vgprs. */
+   bool gfx10_sendmsg;
+   /* Xclipse 920 (GFX10_4): MIMG NSA takes up to 3 dwords without GFX11 partial-NSA tail. */
+   bool gfx10_nsa;
    uint32_t address32_hi;
 };
 
