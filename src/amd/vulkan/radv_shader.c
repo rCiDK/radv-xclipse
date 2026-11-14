@@ -3749,7 +3749,7 @@ radv_aco_fill_compiler_options(struct aco_compiler_options *aco_info, const stru
 
       aco_info->gfx_level = GFX11;
       aco_info->has_vopd = false;
-      aco_info->no_delay_alu = cfg->delay_alu >= 0 ? !cfg->delay_alu : true;
+      aco_info->no_delay_alu = cfg->delay_alu >= 0 ? !cfg->delay_alu : !titan;
       aco_info->no_permlane64 = cfg->permlane64 >= 0 ? !cfg->permlane64 : true;
       if (cfg->ldsdir_drain == 0) {
          aco_info->ldsdir_valu_drain = false;
@@ -3762,9 +3762,9 @@ radv_aco_fill_compiler_options(struct aco_compiler_options *aco_info, const stru
          aco_info->ldsdir_hazard_drain = true;
       } else {
          aco_info->ldsdir_valu_drain = !titan;
-         aco_info->ldsdir_hazard_drain = titan;
+         aco_info->ldsdir_hazard_drain = false;
       }
-      aco_info->gfx10_global_offsets = cfg->offsets13 >= 0 ? !cfg->offsets13 : true;
+      aco_info->gfx10_global_offsets = cfg->offsets13 >= 0 ? !cfg->offsets13 : !titan;
       aco_info->swizzle_no_idxen = cfg->swizzle_idxen >= 0 ? !cfg->swizzle_idxen : true;
       aco_info->gfx10_export_encoding = true;
       aco_info->gfx10_4_fmask = !titan;
