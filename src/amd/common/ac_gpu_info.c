@@ -332,7 +332,9 @@ ac_xclipse_mesh_shaders(const struct radeon_info *info)
 }
 
 /* RADV_XCLIPSE_SYNC263 / debug.radv_xclipse_sync263: emit barriers the Mesa 26.3 way on Xclipse
- * (ac_barrier_state::xclipse_legacy_sync). On by default on every Xclipse; 0 = upstream 27.0. */
+ * (ac_barrier_state::xclipse_legacy_sync). On by default on Xclipse except 940 (MGFX2), where
+ * upstream 27.0 barriers and BOTTOM_OF_PIPE query waits were verified clean; 0 = upstream 27.0,
+ * 1 = force legacy sync. */
 bool
 ac_xclipse_legacy_sync(const struct radeon_info *info)
 {
@@ -341,7 +343,9 @@ ac_xclipse_legacy_sync(const struct radeon_info *info)
       const char *src;
       knob = xclipse_knob_int("RADV_XCLIPSE_SYNC263", "debug.radv_xclipse_sync263", &src);
    }
-   return info->xclipse_model != AC_XCLIPSE_NONE && knob != 0;
+   if (info->xclipse_model == AC_XCLIPSE_NONE || knob == 0)
+      return false;
+   return knob > 0 || info->xclipse_model != AC_XCLIPSE_940;
 }
 
 /* RADV_XCLIPSE_SPI11 / debug.radv_xclipse_spi11: program the SPI wave launch registers as the
