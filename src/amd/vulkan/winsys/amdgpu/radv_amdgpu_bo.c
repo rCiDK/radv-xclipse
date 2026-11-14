@@ -261,13 +261,20 @@ xclipse_memguard_reject(struct radv_amdgpu_winsys *ws, uint64_t size)
 
    if (is_8gb) {
       const bool soft_ramp = !override_bytes;
+      /* Reserve 512 MB headroom under the 32M/hard caps for 64M+ slabs instead of 0 MB: native
+       * Vulkan apps and Switch emulators (e.g. Eden/Yuzu) allocate 256 MB pools at startup without
+       * a DXVK-style step-down fallback, while tight-memory 64M+ growth still steps down early. */
+      const uint64_t soft64_local =
+         soft_ramp && local_hard > (512ull << 20) ? local_hard - (512ull << 20) : local_hard;
+      const uint64_t soft64_sys =
+         soft_ramp && sys_hard > (512ull << 20) ? sys_hard - (512ull << 20) : sys_hard;
       const struct {
          uint64_t min_size;
          uint64_t local;
          uint64_t sys;
          const char *name;
       } tiers[] = {
-         {64ull << 20, soft_ramp ? 0 : local_hard, soft_ramp ? 0 : sys_hard, "soft64M"},
+         {64ull << 20, soft64_local, soft64_sys, "soft64M"},
          {32ull << 20, local_hard, sys_hard, "soft32M"},
          {2ull << 20, local_hard + (128ull << 20), sys_hard + (128ull << 20), "hard"},
       };
