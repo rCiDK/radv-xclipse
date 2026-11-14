@@ -10,6 +10,8 @@
 #include "ac_debug.h"
 #include "ac_surface.h"
 #include "ac_linux_drm.h"
+#include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 #include "util/u_sync_provider.h"
 
 #include "addrlib/src/amdgpu_asic_addr.h"
@@ -224,7 +226,8 @@ static const struct ac_xclipse_chip ac_xclipse_chips[AC_XCLIPSE_MODEL_COUNT] = {
                            {64, 3, 8, 0x03ff0154, 0x00c00000, true}},
    [AC_XCLIPSE_530]     = {"530",     "TITAN",         true,  false, true,   false, false, false,
                            {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
-   [AC_XCLIPSE_940]     = {"940",     "MAGELLAN CARL", true,  true,  true,   true,  false, false},
+   [AC_XCLIPSE_940]     = {"940",     "MAGELLAN CARL", true,  true,  true,   true,  false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, true}},
    [AC_XCLIPSE_540]     = {"540",     "ARIEL",         true,  false, true,   true,  false, false},
    /* The 950's early vsprobe timeouts and the 960's draw timeouts were mid-IB preemption with
     * register shadowing, now off on every Xclipse (see has_kernelq_reg_shadowing). The 950's BVH
@@ -247,19 +250,47 @@ ac_xclipse_chip_info(const struct radeon_info *info)
 static int xclipse_knob_int(const char *env_name, const char *prop_name, const char **src_out);
 
 /* RADV_XCLIPSE_PBB / debug.radv_xclipse_pbb: 0 = upstream binning, 1 = the vendor's (on chips
- * whose values are known), unset = the chip row's default. */
+ * whose values are known), 32/64/128/256/512 = vendor binning with that fixed square bin size,
+ * unset = the chip row's default. */
 const struct ac_xclipse_pbb *
 ac_xclipse_pbb(const struct radeon_info *info)
 {
+   static simple_mtx_t pbb_lock = SIMPLE_MTX_INITIALIZER;
    static int knob = -2;
-   if (knob == -2) {
-      const char *src;
-      knob = xclipse_knob_int("RADV_XCLIPSE_PBB", "debug.radv_xclipse_pbb", &src);
-   }
+   static struct ac_xclipse_pbb custom;
    const struct ac_xclipse_pbb *pbb = &ac_xclipse_chip_info(info)->pbb;
-   if (!pbb->cntl_1 || knob == 0)
+
+   int k = p_atomic_read(&knob);
+   if (k == -2) {
+      simple_mtx_lock(&pbb_lock);
+      k = p_atomic_read(&knob);
+      if (k == -2) {
+         const char *src = "default";
+         k = xclipse_knob_int("RADV_XCLIPSE_PBB", "debug.radv_xclipse_pbb", &src);
+         const bool custom_bin = k >= 32 && k <= 512 && (k & (k - 1)) == 0;
+         if (custom_bin && pbb->cntl_1) {
+            custom = *pbb;
+            custom.bin_size = (unsigned)k;
+         }
+         if (info->xclipse_model != AC_XCLIPSE_NONE) {
+            const bool active = pbb->cntl_1 && k != 0 && (k > 0 || pbb->on);
+            const unsigned bin = active ? (custom_bin ? (unsigned)k : pbb->bin_size) : 0;
+            AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM",
+                            "[ARM] pbb=%d (%s) active=%d bin=%u cntl1=0x%08x cntl2=0x%08x",
+                            k, src, active, bin, active ? pbb->cntl_1 : 0, active ? pbb->cntl_2 : 0);
+         }
+         p_atomic_set(&knob, k);
+      }
+      simple_mtx_unlock(&pbb_lock);
+   }
+
+   if (!pbb->cntl_1 || k == 0)
       return NULL;
-   return knob > 0 || pbb->on ? pbb : NULL;
+   if (!(k > 0 || pbb->on))
+      return NULL;
+   if (k >= 32 && k <= 512 && (k & (k - 1)) == 0)
+      return &custom;
+   return pbb;
 }
 
 /* RADV_XCLIPSE_DBFLUSH / debug.radv_xclipse_dbflush: flush DB with CACHE_FLUSH_AND_INV_TS (CB and DB
