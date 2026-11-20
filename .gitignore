@@ -6,3 +6,4 @@
 /subprojects/packagecache/
 *.pyc
 __pycache__/
+/research
