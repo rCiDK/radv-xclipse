@@ -404,6 +404,8 @@ void radv_update_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_
 
 void radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
                          const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent);
+void radv_meta_decode_bc_batch(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+                               uint32_t region_count, const VkBufferImageCopy2 *regions, uint64_t src_buf_va);
 /* An aliased BC5 image (radv_image.xclipse_bc_alias): transcode straight from the copy's source,
  * row length and image height in texels as in VkBufferImageCopy (already defaulted to the extent). */
 void radv_meta_decode_bc_from_buffer(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,

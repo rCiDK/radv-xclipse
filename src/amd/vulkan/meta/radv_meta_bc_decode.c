@@ -570,16 +570,16 @@ get_pipeline(struct radv_device *device, enum bc_variant variant, VkPipeline *pi
 static bool
 bc_eac_lut_init(struct radv_device *device)
 {
-   if (device->meta_state.xclipse_bc.eac_lut_bo)
+   if (p_atomic_read(&device->meta_state.xclipse_bc.eac_lut_bo))
       return true;
+   struct radeon_winsys_bo *bo = NULL;
    if (radv_bo_create(device, NULL, BC_EAC_LUT_BYTES, 4096, RADEON_DOMAIN_GTT,
-                      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
-                      RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &device->meta_state.xclipse_bc.eac_lut_bo) != VK_SUCCESS)
+                      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_PREFER_LOCAL_BO,
+                      RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &bo) != VK_SUCCESS)
       return false;
-   void *p = radv_buffer_map(device->ws, device->meta_state.xclipse_bc.eac_lut_bo);
+   void *p = radv_buffer_map(device->ws, bo);
    if (!p) {
-      radv_bo_destroy(device, NULL, device->meta_state.xclipse_bc.eac_lut_bo);
-      device->meta_state.xclipse_bc.eac_lut_bo = NULL;
+      radv_bo_destroy(device, NULL, bo);
       return false;
    }
    uint32_t *w = p;
@@ -589,7 +589,8 @@ bc_eac_lut_init(struct radv_device *device)
       w[i * 4 + 2] = eac_remap[i * 2 + 1];
       w[i * 4 + 3] = 0;
    }
-   device->meta_state.xclipse_bc.eac_lut_va = radv_buffer_get_va(device->meta_state.xclipse_bc.eac_lut_bo);
+   device->meta_state.xclipse_bc.eac_lut_va = radv_buffer_get_va(bo);
+   p_atomic_set(&device->meta_state.xclipse_bc.eac_lut_bo, bo);
    return true;
 }
 
@@ -603,31 +604,48 @@ bc_eac_lut_init(struct radv_device *device)
 static bool
 bc_hist_init(struct radv_device *device)
 {
-   if (device->meta_state.xclipse_bc.hist_bo)
+   if (p_atomic_read(&device->meta_state.xclipse_bc.hist_bo))
       return true;
+   struct radeon_winsys_bo *bo = NULL;
    if (radv_bo_create(device, NULL, BC_HIST_BYTES, 4096, RADEON_DOMAIN_GTT,
-                      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING, RADV_BO_PRIORITY_UPLOAD_BUFFER,
-                      0, true, &device->meta_state.xclipse_bc.hist_bo) != VK_SUCCESS)
+                      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_PREFER_LOCAL_BO,
+                      RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &bo) != VK_SUCCESS)
       return false;
-   device->meta_state.xclipse_bc.hist_ptr = radv_buffer_map(device->ws, device->meta_state.xclipse_bc.hist_bo);
-   if (!device->meta_state.xclipse_bc.hist_ptr) {
-      radv_bo_destroy(device, NULL, device->meta_state.xclipse_bc.hist_bo);
-      device->meta_state.xclipse_bc.hist_bo = NULL;
+   void *ptr = radv_buffer_map(device->ws, bo);
+   if (!ptr) {
+      radv_bo_destroy(device, NULL, bo);
       return false;
    }
-   memset(device->meta_state.xclipse_bc.hist_ptr, 0, BC_HIST_BYTES);
-   device->meta_state.xclipse_bc.hist_va = radv_buffer_get_va(device->meta_state.xclipse_bc.hist_bo);
+   memset(ptr, 0, BC_HIST_BYTES);
+   device->meta_state.xclipse_bc.hist_ptr = ptr;
+   device->meta_state.xclipse_bc.hist_va = radv_buffer_get_va(bo);
+   p_atomic_set(&device->meta_state.xclipse_bc.hist_bo, bo);
    return true;
 }
 
 static bool
-bc_resources_init(struct radv_device *device)
+bc_variant_uses_eac_lut(enum bc_variant variant)
 {
+   return variant == BC_VARIANT_EAC || variant == BC_VARIANT_EAC_BUF ||
+          variant == BC_VARIANT_EAC_R || variant == BC_VARIANT_EAC_R_BUF;
+}
+
+static bool
+bc_resources_init(struct radv_device *device, bool need_hist, bool need_eac_lut)
+{
+   if ((!need_hist || p_atomic_read(&device->meta_state.xclipse_bc.hist_bo)) &&
+       (!need_eac_lut || p_atomic_read(&device->meta_state.xclipse_bc.eac_lut_bo)))
+      return true;
+
    /* Command buffers may record their first BC decode concurrently. Do not let another thread
     * use a BO until its mapping, contents and GPU address have all been initialized.
     */
    mtx_lock(&device->meta_state.mtx);
-   const bool initialized = bc_hist_init(device) && bc_eac_lut_init(device);
+   bool initialized = true;
+   if (need_hist)
+      initialized = bc_hist_init(device);
+   if (initialized && need_eac_lut)
+      initialized = bc_eac_lut_init(device);
    mtx_unlock(&device->meta_state.mtx);
    return initialized;
 }
@@ -702,290 +720,347 @@ bc_buf_variant(enum bc_variant variant)
  * format is what the blocks are decoded as, and dst_image where the result goes: image itself
  * (its plane 1), or image->xclipse_bc6h_alt with the other BC6H format. */
 static void
-bc_decode(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
-          const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent, uint64_t src_va,
-          uint32_t src_row_blocks, uint32_t src_slice_blocks, VkFormat format, struct radv_image *dst_image)
+bc_decode_batch(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+                uint32_t region_count, const VkBufferImageCopy2 *regions, uint64_t src_buf_va,
+                VkFormat format, struct radv_image *dst_image)
 {
+   if (!region_count)
+      return;
+
    RADV_CPU_T0();
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    VkPipeline pipeline;
    VkPipelineLayout p_layout;
 
+   const enum bc_variant base_var = bc_variant(format);
+   const enum bc_variant var = src_buf_va ? bc_buf_variant(base_var) : base_var;
+
    const uint64_t _pipe_t0 = radv_cpushare_now();
-   const VkResult _pipe_r =
-      get_pipeline(device, src_va ? bc_buf_variant(bc_variant(format)) : bc_variant(format), &pipeline, &p_layout);
+   const VkResult _pipe_r = get_pipeline(device, var, &pipeline, &p_layout);
    radv_cpushare_add(RADV_CPU_PIPELINE, radv_cpushare_now() - _pipe_t0);
    if (_pipe_r != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
 
-   if (!bc_resources_init(device)) {
+   const bool need_hist = ac_xclipse_log_level() >= 1;
+   const bool need_eac_lut = bc_variant_uses_eac_lut(var);
+   if (!bc_resources_init(device, need_hist, need_eac_lut)) {
       vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
-   radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->meta_state.xclipse_bc.hist_bo);
-   radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->meta_state.xclipse_bc.eac_lut_bo);
+   if (need_hist && device->meta_state.xclipse_bc.hist_bo)
+      radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->meta_state.xclipse_bc.hist_bo);
+   if (need_eac_lut && device->meta_state.xclipse_bc.eac_lut_bo)
+      radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->meta_state.xclipse_bc.eac_lut_bo);
+
+   radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
 
    const bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
-   const uint32_t base_slice = is_3d ? offset.z : subresource->baseArrayLayer;
-   const uint32_t slice_count = is_3d ? extent.depth : vk_image_subresource_layer_count(&image->vk, subresource);
-   const uint32_t layer_end = subresource->baseArrayLayer + vk_image_subresource_layer_count(&image->vk, subresource);
    const VkImageViewType view_type = is_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-
-   extent = vk_image_sanitize_extent(&image->vk, extent);
-   offset = vk_image_sanitize_offset(&image->vk, offset);
-
-#ifdef __ANDROID__
-   /* Tracked after sanitising, so the SHAPE key sees the real extent. */
-   if (ac_xclipse_log_level() >= 1) /* census, diagnostics only */
-      bc_rpt_track(image, subresource->mipLevel, format, extent.width, extent.height);
-#endif
-
-   /* Source: the compressed plane, viewed as uint texels, one per 4x4 block. Not built when the
-    * blocks come from a buffer: binding 0 is then a null (zeroed) descriptor the shader never reads,
-    * and one image view less is CPU work saved on every upload. */
    const VkImageViewUsage2CreateInfoKHR src_usage = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_2_CREATE_INFO_KHR,
       .usage = VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR,
    };
-   struct radv_image_view src_iview;
-   if (!src_va) {
-      radv_image_view_init(&src_iview, device,
-                           &(VkImageViewCreateInfo){
-                              .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                              .pNext = &src_usage,
-                              .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
-                              .image = radv_image_to_handle(image),
-                              .viewType = view_type,
-                              .format = bc_load_format(format),
-                              .subresourceRange =
-                                 {
-                                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                    .baseMipLevel = subresource->mipLevel,
-                                    .levelCount = 1,
-                                    .baseArrayLayer = 0,
-                                    .layerCount = layer_end,
-                                 },
-                           },
-                           NULL);
-   }
-
-   /* Destination: the hidden decoded plane. */
    const VkImageViewUsage2CreateInfoKHR dst_usage = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_2_CREATE_INFO_KHR,
       .usage = VK_IMAGE_USAGE_2_STORAGE_BIT_KHR,
    };
+
+   struct radv_image_view src_iview;
    struct radv_image_view dst_iview;
-   radv_image_view_init(&dst_iview, device,
-                        &(VkImageViewCreateInfo){
-                           .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                           .pNext = &dst_usage,
-                           .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
-                           .image = radv_image_to_handle(dst_image),
-                           .viewType = view_type,
-                           .format = bc_store_format(format),
-                           .subresourceRange =
-                              {
-                                 .aspectMask = dst_image == image ? VK_IMAGE_ASPECT_PLANE_1_BIT
-                                                                  : VK_IMAGE_ASPECT_COLOR_BIT,
-                                 .baseMipLevel = subresource->mipLevel,
-                                 .levelCount = 1,
-                                 .baseArrayLayer = 0,
-                                 .layerCount = layer_end,
+   bool views_init = false;
+   uint32_t prev_mip = UINT32_MAX;
+   uint32_t prev_layer_end = 0;
+
+   for (uint32_t r = 0; r < region_count; r++) {
+      const VkBufferImageCopy2 *region = &regions[r];
+      const VkImageSubresourceLayers *subresource = &region->imageSubresource;
+      const uint32_t base_slice = is_3d ? region->imageOffset.z : subresource->baseArrayLayer;
+      const uint32_t slice_count =
+         is_3d ? region->imageExtent.depth : vk_image_subresource_layer_count(&image->vk, subresource);
+      const uint32_t layer_end = subresource->baseArrayLayer + vk_image_subresource_layer_count(&image->vk, subresource);
+
+      const VkExtent3D extent = vk_image_sanitize_extent(&image->vk, region->imageExtent);
+      const VkOffset3D offset = vk_image_sanitize_offset(&image->vk, region->imageOffset);
+
+      uint64_t src_va = 0;
+      uint32_t src_row_blocks = 0;
+      uint32_t src_slice_blocks = 0;
+      if (src_buf_va) {
+         const uint32_t row_texels = region->bufferRowLength ? region->bufferRowLength : extent.width;
+         const uint32_t img_h_texels = region->bufferImageHeight ? region->bufferImageHeight : extent.height;
+         src_va = src_buf_va + region->bufferOffset;
+         src_row_blocks = DIV_ROUND_UP(row_texels, 4);
+         src_slice_blocks = src_row_blocks * DIV_ROUND_UP(img_h_texels, 4);
+      }
+
+#ifdef __ANDROID__
+      /* Tracked after sanitising, so the SHAPE key sees the real extent. */
+      if (need_hist) /* census, diagnostics only */
+         bc_rpt_track(image, subresource->mipLevel, format, extent.width, extent.height);
+#endif
+
+      if (!views_init || subresource->mipLevel != prev_mip || layer_end != prev_layer_end) {
+         if (views_init) {
+            if (!src_buf_va)
+               radv_image_view_finish(&src_iview);
+            radv_image_view_finish(&dst_iview);
+         }
+
+         if (!src_buf_va) {
+            radv_image_view_init(&src_iview, device,
+                                 &(VkImageViewCreateInfo){
+                                    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                    .pNext = &src_usage,
+                                    .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+                                    .image = radv_image_to_handle(image),
+                                    .viewType = view_type,
+                                    .format = bc_load_format(format),
+                                    .subresourceRange =
+                                       {
+                                          .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                          .baseMipLevel = subresource->mipLevel,
+                                          .levelCount = 1,
+                                          .baseArrayLayer = 0,
+                                          .layerCount = layer_end,
+                                       },
+                                 },
+                                 NULL);
+         }
+
+         radv_image_view_init(&dst_iview, device,
+                              &(VkImageViewCreateInfo){
+                                 .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                 .pNext = &dst_usage,
+                                 .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+                                 .image = radv_image_to_handle(dst_image),
+                                 .viewType = view_type,
+                                 .format = bc_store_format(format),
+                                 .subresourceRange =
+                                    {
+                                       .aspectMask = dst_image == image ? VK_IMAGE_ASPECT_PLANE_1_BIT
+                                                                        : VK_IMAGE_ASPECT_COLOR_BIT,
+                                       .baseMipLevel = subresource->mipLevel,
+                                       .levelCount = 1,
+                                       .baseArrayLayer = 0,
+                                       .layerCount = layer_end,
+                                    },
                               },
-                        },
-                        NULL);
+                              NULL);
 
-   radv_meta_bind_descriptors(
-      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p_layout, 4,
-      (VkDescriptorGetInfoEXT[]){{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
-                                  .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                  .data.pSampledImage =
-                                     (VkDescriptorImageInfo[]){
-                                        {.sampler = VK_NULL_HANDLE,
-                                         .imageView = src_va ? VK_NULL_HANDLE : radv_image_view_to_handle(&src_iview),
-                                         .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                                     }},
-                                 {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
-                                  .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                  .data.pStorageImage = (VkDescriptorImageInfo[]){
-                                     {.sampler = VK_NULL_HANDLE,
-                                      .imageView = radv_image_view_to_handle(&dst_iview),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                                  }},
-                                 {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
-                                  .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                  .data.pStorageBuffer = (VkDescriptorAddressInfoEXT[]){
-                                     {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
-                                      .address = device->meta_state.xclipse_bc.hist_va,
-                                      .range = BC_HIST_BYTES,
-                                      .format = VK_FORMAT_UNDEFINED},
-                                  }},
-                                 {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
-                                  .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                  .data.pStorageBuffer = (VkDescriptorAddressInfoEXT[]){
-                                     {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
-                                      .address = device->meta_state.xclipse_bc.eac_lut_va,
-                                      .range = BC_EAC_LUT_BYTES,
-                                      .format = VK_FORMAT_UNDEFINED},
-                                  }}});
+         radv_meta_bind_descriptors(
+            cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p_layout, 4,
+            (VkDescriptorGetInfoEXT[]){
+               {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+                .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                .data.pSampledImage =
+                   (VkDescriptorImageInfo[]){
+                      {.sampler = VK_NULL_HANDLE,
+                       .imageView = src_buf_va ? VK_NULL_HANDLE : radv_image_view_to_handle(&src_iview),
+                       .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                   }},
+               {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+                .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .data.pStorageImage =
+                   (VkDescriptorImageInfo[]){
+                      {.sampler = VK_NULL_HANDLE,
+                       .imageView = radv_image_view_to_handle(&dst_iview),
+                       .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                   }},
+               {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+                .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .data.pStorageBuffer =
+                   (VkDescriptorAddressInfoEXT[]){
+                      {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                       .address = need_hist ? device->meta_state.xclipse_bc.hist_va : 0,
+                       .range = need_hist ? BC_HIST_BYTES : 0,
+                       .format = VK_FORMAT_UNDEFINED},
+                   }},
+               {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
+                .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .data.pStorageBuffer =
+                   (VkDescriptorAddressInfoEXT[]){
+                      {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
+                       .address = need_eac_lut ? device->meta_state.xclipse_bc.eac_lut_va : 0,
+                       .range = need_eac_lut ? BC_EAC_LUT_BYTES : 0,
+                       .format = VK_FORMAT_UNDEFINED},
+                   }}});
 
-   radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
+         views_init = true;
+         prev_mip = subresource->mipLevel;
+         prev_layer_end = layer_end;
+      }
 
 #ifdef __ANDROID__
-   const int hash_slot = bc_content_slot(device, extent.width, extent.height);
+      const int hash_slot = bc_content_slot(device, extent.width, extent.height);
 #else
-   const int hash_slot = -1;
+      const int hash_slot = -1;
 #endif
-   const unsigned push_constants[12] = {
-      offset.x, offset.y, base_slice, bc_shader_format(format), image->vk.image_type,
-      extent.width, extent.height, (unsigned)hash_slot,
-      (unsigned)src_va, (unsigned)(src_va >> 32), src_row_blocks, src_slice_blocks,
-   };
-   radv_meta_push_constants(cmd_buffer, p_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
-                            push_constants);
+      const unsigned push_constants[12] = {
+         offset.x, offset.y, base_slice, bc_shader_format(format), image->vk.image_type,
+         extent.width, extent.height, (unsigned)hash_slot,
+         (unsigned)src_va, (unsigned)(src_va >> 32), src_row_blocks, src_slice_blocks,
+      };
+      radv_meta_push_constants(cmd_buffer, p_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
+                               push_constants);
 
-   /* Dispatch whole 8x8 workgroups and let the shader's bounds check mask the surplus: the
-    * partial-workgroup path of radv_unaligned_dispatch() writes nothing on the Xclipse 920.
-    * One invocation per 4x4 block, so the dispatch is ceil(texels/4) / 8. Change together with
-    * bc_decoder.glsl.
-    */
-   const struct radv_dispatch_info info = {
-      .blocks = {DIV_ROUND_UP(DIV_ROUND_UP(extent.width, 4), 8),
-                 DIV_ROUND_UP(DIV_ROUND_UP(extent.height, 4), 8), slice_count},
-   };
-   /* Mark this dispatch as a decode so radv_emit_cache_flush() does not drain the post-decode flush
-    * a previous decode left pending. Covers only the dispatch emission. */
-   cmd_buffer->state.bc_decode_active++;
-   radv_compute_dispatch(cmd_buffer, &info);
-   cmd_buffer->state.bc_decode_active--;
+      /* Dispatch whole 8x8 workgroups and let the shader's bounds check mask the surplus: the
+       * partial-workgroup path of radv_unaligned_dispatch() writes nothing on the Xclipse 920.
+       * One invocation per 4x4 block, so the dispatch is ceil(texels/4) / 8. Change together with
+       * bc_decoder.glsl.
+       */
+      const struct radv_dispatch_info info = {
+         .blocks = {DIV_ROUND_UP(DIV_ROUND_UP(extent.width, 4), 8),
+                    DIV_ROUND_UP(DIV_ROUND_UP(extent.height, 4), 8), slice_count},
+      };
+      /* Mark this dispatch as a decode so radv_emit_cache_flush() does not drain the post-decode flush
+       * a previous decode left pending. Covers only the dispatch emission. */
+      cmd_buffer->state.bc_decode_active++;
+      radv_compute_dispatch(cmd_buffer, &info);
+      cmd_buffer->state.bc_decode_active--;
 
 #ifdef __ANDROID__
-   /* Count decodes and report the rate, summarised (logging each would perturb the storm).
-    * BC emulation cannot be switched off for an A/B: D3D11 titles require textureCompressionBC. */
-   if (ac_xclipse_log_level() >= 1) { /* census, diagnostics only */
-      static uint32_t n_decode;
-      static uint64_t window_start_ms, last_report_ms;
-      static uint32_t window_n;
-      struct timespec ts;
-      clock_gettime(CLOCK_MONOTONIC, &ts);
-      const uint64_t now = (uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
-      const uint32_t total = p_atomic_inc_return(&n_decode);
+      /* Count decodes and report the rate, summarised (logging each would perturb the storm).
+       * BC emulation cannot be switched off for an A/B: D3D11 titles require textureCompressionBC. */
+      if (need_hist) { /* census, diagnostics only */
+         static uint32_t n_decode;
+         static uint64_t window_start_ms, last_report_ms;
+         static uint32_t window_n;
+         struct timespec ts;
+         clock_gettime(CLOCK_MONOTONIC, &ts);
+         const uint64_t now = (uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
+         const uint32_t total = p_atomic_inc_return(&n_decode);
 
-      /* [BCFMT]: per-format census since process start (the fmt= field above is a 1 Hz sample).
-       * Counted in decodes (presence) and blocks (weight). */
-      static uint32_t fmt_decodes[7], fmt_blocks[7];
-      {
-         const unsigned fi = (unsigned)bc_shader_format(format);
-         const uint32_t nblk = (((uint32_t)extent.width + 3) >> 2) * (((uint32_t)extent.height + 3) >> 2);
-         p_atomic_inc(&fmt_decodes[fi]);
-         p_atomic_add(&fmt_blocks[fi], nblk);
-      }
-
-      if (!window_start_ms) {
-         window_start_ms = last_report_ms = now;
-         window_n = 0;
-      }
-      window_n++;
-      if (now - last_report_ms >= 1000) {
-         const uint64_t span = now - last_report_ms;
-         AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
-                             "[BCDECODE] %u decodes in last %llu ms (%.0f/s) | total=%u | "
-                             "last %ux%u fmt=%u",
-                             window_n, (unsigned long long)span,
-                             span ? (double)window_n * 1000.0 / (double)span : 0.0, total,
-                             extent.width, extent.height, (unsigned)format);
-         last_report_ms = now;
-         window_n = 0;
-
-         /* Every emulated format, every decode. BC4/BC5_UNORM transcode through the same dispatch
-          * and are counted too. */
+         /* [BCFMT]: per-format census since process start (the fmt= field above is a 1 Hz sample).
+          * Counted in decodes (presence) and blocks (weight). */
+         static uint32_t fmt_decodes[7], fmt_blocks[7];
          {
-            static const char *const fname[7] = {"BC4U", "BC4S", "BC5U", "BC5S", "BC6HU", "BC6HS", "BC7"};
-            char line[320];
-            char *p = line;
-            uint64_t tot_blk = 0;
-            for (int i = 0; i < 7; i++)
-               tot_blk += fmt_blocks[i];
-            for (int i = 0; i < 7; i++) {
-               if (!fmt_decodes[i])
-                  continue;
-               p += sprintf(p, " %s:%u/%.1f%%", fname[i], fmt_decodes[i],
-                            tot_blk ? 100.0 * (double)fmt_blocks[i] / (double)tot_blk : 0.0);
+            const unsigned fi = (unsigned)bc_shader_format(format);
+            const uint32_t nblk = (((uint32_t)extent.width + 3) >> 2) * (((uint32_t)extent.height + 3) >> 2);
+            p_atomic_inc(&fmt_decodes[fi]);
+            p_atomic_add(&fmt_blocks[fi], nblk);
+         }
+
+         if (!window_start_ms) {
+            window_start_ms = last_report_ms = now;
+            window_n = 0;
+         }
+         window_n++;
+         if (now - last_report_ms >= 1000) {
+            const uint64_t span = now - last_report_ms;
+            AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
+                                "[BCDECODE] %u decodes in last %llu ms (%.0f/s) | total=%u | "
+                                "last %ux%u fmt=%u",
+                                window_n, (unsigned long long)span,
+                                span ? (double)window_n * 1000.0 / (double)span : 0.0, total,
+                                extent.width, extent.height, (unsigned)format);
+            last_report_ms = now;
+            window_n = 0;
+
+            /* Every emulated format, every decode. BC4/BC5_UNORM transcode through the same dispatch
+             * and are counted too. */
+            {
+               static const char *const fname[7] = {"BC4U", "BC4S", "BC5U", "BC5S", "BC6HU", "BC6HS", "BC7"};
+               char line[320];
+               char *p = line;
+               uint64_t tot_blk = 0;
+               for (int i = 0; i < 7; i++)
+                  tot_blk += fmt_blocks[i];
+               for (int i = 0; i < 7; i++) {
+                  if (!fmt_decodes[i])
+                     continue;
+                  p += sprintf(p, " %s:%u/%.1f%%", fname[i], fmt_decodes[i],
+                               tot_blk ? 100.0 * (double)fmt_blocks[i] / (double)tot_blk : 0.0);
+               }
+               if (p != line)
+                  AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
+                                      "[BCFMT] decodes/share-of-blocks:%s | total_blocks=%llu", line,
+                                      (unsigned long long)tot_blk);
             }
-            if (p != line)
+
+            /* Share of real BC4/BC5 blocks with endpoint spread <= 32 (exactly decodable by the texture
+             * unit). Quiet until some BC4/BC5 was decoded. */
+            if (device->meta_state.xclipse_bc.hist_ptr && device->meta_state.xclipse_bc.hist_ptr[6]) {
+               const uint32_t *h = device->meta_state.xclipse_bc.hist_ptr;
+               const uint32_t tot = h[6];
+               const uint32_t narrow = h[0] + h[1] + h[2];   /* spread <= 32 */
+               /* h[8] (both filters) is the real number: the r0 <= r1 mode is off-line at any spread. */
                AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
-                                   "[BCFMT] decodes/share-of-blocks:%s | total_blocks=%llu", line,
-                                   (unsigned long long)tot_blk);
-         }
+                                   "[BCSPREAD] sampled=%u narrow=%u (%.1f%%) mode8=%u (%.1f%%) "
+                                   "offline=%u (%.1f%%) DECODABLE=%u (%.1f%%) | "
+                                   "<=8:%u 9-16:%u 17-32:%u 33-64:%u 65-128:%u >128:%u",
+                                   tot, narrow, 100.0 * (double)narrow / (double)tot,
+                                   h[7], 100.0 * (double)h[7] / (double)tot,
+                                   h[9], 100.0 * (double)h[9] / (double)tot,
+                                   h[8], 100.0 * (double)h[8] / (double)tot,
+                                   h[0], h[1], h[2], h[3], h[4], h[5]);
+            }
 
-         /* Share of real BC4/BC5 blocks with endpoint spread <= 32 (exactly decodable by the texture
-          * unit). Quiet until some BC4/BC5 was decoded. */
-         if (device->meta_state.xclipse_bc.hist_ptr && device->meta_state.xclipse_bc.hist_ptr[6]) {
-            const uint32_t *h = device->meta_state.xclipse_bc.hist_ptr;
-            const uint32_t tot = h[6];
-            const uint32_t narrow = h[0] + h[1] + h[2];   /* spread <= 32 */
-            /* h[8] (both filters) is the real number: the r0 <= r1 mode is off-line at any spread. */
-            AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
-                                "[BCSPREAD] sampled=%u narrow=%u (%.1f%%) mode8=%u (%.1f%%) "
-                                "offline=%u (%.1f%%) DECODABLE=%u (%.1f%%) | "
-                                "<=8:%u 9-16:%u 17-32:%u 33-64:%u 65-128:%u >128:%u",
-                                tot, narrow, 100.0 * (double)narrow / (double)tot,
-                                h[7], 100.0 * (double)h[7] / (double)tot,
-                                h[9], 100.0 * (double)h[9] / (double)tot,
-                                h[8], 100.0 * (double)h[8] / (double)tot,
-                                h[0], h[1], h[2], h[3], h[4], h[5]);
-         }
+            /* BC5 census (bc_record_rg in bc_decoder.glsl): VIABLE = R and G spans agree within 2 LSB
+             * (ASTC dual-plane CEM 0 shares one endpoint pair). Reported as a distribution. BC5 only. */
+            if (device->meta_state.xclipse_bc.hist_ptr && device->meta_state.xclipse_bc.hist_ptr[17]) {
+               const uint32_t *h = device->meta_state.xclipse_bc.hist_ptr;
+               const uint32_t tot = h[17];
+               const uint32_t viable = h[10] + h[11];
+               AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
+                                   "[BCRG] blocks=%u VIABLE(<=2)=%u (%.1f%%) | "
+                                   "0:%u 1-2:%u 3-4:%u 5-8:%u 9-16:%u 17-32:%u >32:%u",
+                                   tot, viable, 100.0 * (double)viable / (double)tot,
+                                   h[10], h[11], h[12], h[13], h[14], h[15], h[16]);
+            }
 
-         /* BC5 census (bc_record_rg in bc_decoder.glsl): VIABLE = R and G spans agree within 2 LSB
-          * (ASTC dual-plane CEM 0 shares one endpoint pair). Reported as a distribution. BC5 only. */
-         if (device->meta_state.xclipse_bc.hist_ptr && device->meta_state.xclipse_bc.hist_ptr[17]) {
-            const uint32_t *h = device->meta_state.xclipse_bc.hist_ptr;
-            const uint32_t tot = h[17];
-            const uint32_t viable = h[10] + h[11];
-            AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
-                                "[BCRG] blocks=%u VIABLE(<=2)=%u (%.1f%%) | "
-                                "0:%u 1-2:%u 3-4:%u 5-8:%u 9-16:%u 17-32:%u >32:%u",
-                                tot, viable, 100.0 * (double)viable / (double)tot,
-                                h[10], h[11], h[12], h[13], h[14], h[15], h[16]);
-         }
-
-         /* BC7 census (bc_record_bc7 in bc_decoder.glsl). ASTC reproduces only 30/64 two-subset and
-          * 11/64 three-subset partitions.
-          * FREE = modes 4/5/6 (single subset). OK/BAD = multi-subset on a pattern ASTC can/cannot
-          * generate. TRANSCODABLE = FREE + OK. */
-         if (device->meta_state.xclipse_bc.hist_ptr && device->meta_state.xclipse_bc.hist_ptr[30]) {
-            const uint32_t *h = device->meta_state.xclipse_bc.hist_ptr;
-            const uint32_t tot = h[30];
-            const uint32_t freeblk = h[18 + 4] + h[18 + 5] + h[18 + 6];
-            const uint32_t ok = h[26] + h[28], bad = h[27] + h[29];
-            AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
-                                "[BC7MODE] blocks=%u | m0:%u m1:%u m2:%u m3:%u m4:%u m5:%u m6:%u m7:%u"
-                                " | FREE(1-subset)=%u (%.1f%%) partOK=%u partBAD=%u"
-                                " | TRANSCODABLE=%.1f%%",
-                                tot, h[18], h[19], h[20], h[21], h[22], h[23], h[24], h[25],
-                                freeblk, 100.0 * (double)freeblk / (double)tot, ok, bad,
-                                100.0 * (double)(freeblk + ok) / (double)tot);
+            /* BC7 census (bc_record_bc7 in bc_decoder.glsl). ASTC reproduces only 30/64 two-subset and
+             * 11/64 three-subset partitions.
+             * FREE = modes 4/5/6 (single subset). OK/BAD = multi-subset on a pattern ASTC can/cannot
+             * generate. TRANSCODABLE = FREE + OK. */
+            if (device->meta_state.xclipse_bc.hist_ptr && device->meta_state.xclipse_bc.hist_ptr[30]) {
+               const uint32_t *h = device->meta_state.xclipse_bc.hist_ptr;
+               const uint32_t tot = h[30];
+               const uint32_t freeblk = h[18 + 4] + h[18 + 5] + h[18 + 6];
+               const uint32_t ok = h[26] + h[28], bad = h[27] + h[29];
+               AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
+                                   "[BC7MODE] blocks=%u | m0:%u m1:%u m2:%u m3:%u m4:%u m5:%u m6:%u m7:%u"
+                                   " | FREE(1-subset)=%u (%.1f%%) partOK=%u partBAD=%u"
+                                   " | TRANSCODABLE=%.1f%%",
+                                   tot, h[18], h[19], h[20], h[21], h[22], h[23], h[24], h[25],
+                                   freeblk, 100.0 * (double)freeblk / (double)tot, ok, bad,
+                                   100.0 * (double)(freeblk + ok) / (double)tot);
+            }
          }
       }
-   }
 #endif
+   }
 
-   if (!src_va)
-      radv_image_view_finish(&src_iview);
-   radv_image_view_finish(&dst_iview);
+   if (views_init) {
+      if (!src_buf_va)
+         radv_image_view_finish(&src_iview);
+      radv_image_view_finish(&dst_iview);
+   }
    RADV_CPU_T1(RADV_CPU_DECODE);
+}
+
+void
+radv_meta_decode_bc_batch(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+                          uint32_t region_count, const VkBufferImageCopy2 *regions, uint64_t src_buf_va)
+{
+   bc_decode_batch(cmd_buffer, image, layout, region_count, regions, src_buf_va, image->vk.format, image);
+   if (image->xclipse_bc6h_alt)
+      bc_decode_batch(cmd_buffer, image, layout, region_count, regions, src_buf_va, image->xclipse_bc6h_alt_format,
+                      image->xclipse_bc6h_alt);
 }
 
 void
 radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
                     const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent)
 {
-   bc_decode(cmd_buffer, image, layout, subresource, offset, extent, 0, 0, 0, image->vk.format, image);
-   if (image->xclipse_bc6h_alt)
-      bc_decode(cmd_buffer, image, layout, subresource, offset, extent, 0, 0, 0, image->xclipse_bc6h_alt_format,
-                image->xclipse_bc6h_alt);
+   const VkBufferImageCopy2 region = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+      .imageSubresource = *subresource,
+      .imageOffset = offset,
+      .imageExtent = extent,
+   };
+   radv_meta_decode_bc_batch(cmd_buffer, image, layout, 1, &region, 0);
 }
 
 void
@@ -993,9 +1068,15 @@ radv_meta_decode_bc_from_buffer(struct radv_cmd_buffer *cmd_buffer, struct radv_
                                 const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent,
                                 uint64_t src_va, uint32_t row_texels, uint32_t image_height_texels)
 {
-   const uint32_t row_blocks = DIV_ROUND_UP(row_texels, 4);
-   bc_decode(cmd_buffer, image, layout, subresource, offset, extent, src_va, row_blocks,
-             row_blocks * DIV_ROUND_UP(image_height_texels, 4), image->vk.format, image);
+   const VkBufferImageCopy2 region = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+      .bufferRowLength = row_texels,
+      .bufferImageHeight = image_height_texels,
+      .imageSubresource = *subresource,
+      .imageOffset = offset,
+      .imageExtent = extent,
+   };
+   bc_decode_batch(cmd_buffer, image, layout, 1, &region, src_va, image->vk.format, image);
 }
 
 /* Order the decode dispatches against everything that follows. Call once after a run of

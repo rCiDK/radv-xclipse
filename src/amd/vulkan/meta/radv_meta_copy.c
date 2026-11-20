@@ -457,33 +457,29 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
                                                                VK_ACCESS_2_TRANSFER_READ_BIT, 0, dst_image, NULL);
 
       const enum util_format_layout format_layout = radv_format_description(dst_image->vk.format)->layout;
-      for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
-         if (dst_image->xclipse_bc_alias) {
-            const VkBufferImageCopy2 *region = &pCopyBufferToImageInfo->pRegions[r];
-            const VkExtent3D ext = vk_image_sanitize_extent(&dst_image->vk, region->imageExtent);
-            radv_meta_decode_bc_from_buffer(
-               cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout, &region->imageSubresource,
-               region->imageOffset, region->imageExtent,
-               vk_device_address_range(&src_buffer->vk, region->bufferOffset, VK_WHOLE_SIZE).address,
-               region->bufferRowLength ? region->bufferRowLength : ext.width,
-               region->bufferImageHeight ? region->bufferImageHeight : ext.height);
-            continue;
-         }
-         if (format_layout == UTIL_FORMAT_LAYOUT_ASTC) {
-            radv_meta_decode_astc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
-                                  &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
-                                  pCopyBufferToImageInfo->pRegions[r].imageOffset,
-                                  pCopyBufferToImageInfo->pRegions[r].imageExtent);
-         } else if (radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED) {
-            radv_meta_decode_bc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
-                                &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
-                                pCopyBufferToImageInfo->pRegions[r].imageOffset,
-                                pCopyBufferToImageInfo->pRegions[r].imageExtent);
-         } else {
-            radv_meta_decode_etc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
-                                 &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
-                                 pCopyBufferToImageInfo->pRegions[r].imageOffset,
-                                 pCopyBufferToImageInfo->pRegions[r].imageExtent);
+      const bool is_bc_decode =
+         dst_image->xclipse_bc_alias ||
+         (format_layout != UTIL_FORMAT_LAYOUT_ASTC &&
+          radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED);
+
+      if (is_bc_decode) {
+         const uint64_t src_buf_va =
+            dst_image->xclipse_bc_alias ? vk_device_address_range(&src_buffer->vk, 0, VK_WHOLE_SIZE).address : 0;
+         radv_meta_decode_bc_batch(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
+                                   pCopyBufferToImageInfo->regionCount, pCopyBufferToImageInfo->pRegions, src_buf_va);
+      } else {
+         for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
+            if (format_layout == UTIL_FORMAT_LAYOUT_ASTC) {
+               radv_meta_decode_astc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
+                                     &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
+                                     pCopyBufferToImageInfo->pRegions[r].imageOffset,
+                                     pCopyBufferToImageInfo->pRegions[r].imageExtent);
+            } else {
+               radv_meta_decode_etc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
+                                    &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
+                                    pCopyBufferToImageInfo->pRegions[r].imageOffset,
+                                    pCopyBufferToImageInfo->pRegions[r].imageExtent);
+            }
          }
       }
 

@@ -973,7 +973,11 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
 static void
 radv_get_binning_settings(const struct radv_physical_device *pdev, struct radv_binning_settings *settings)
 {
-   if ((pdev->info.has_dedicated_vram && pdev->info.max_render_backends > 4) || pdev->info.gfx_level >= GFX10) {
+   const struct ac_xclipse_pbb *xpbb = ac_xclipse_pbb(&pdev->info);
+   if (xpbb) {
+      settings->context_states_per_bin = xpbb->context_states;
+      settings->persistent_states_per_bin = xpbb->persistent_states;
+   } else if ((pdev->info.has_dedicated_vram && pdev->info.max_render_backends > 4) || pdev->info.gfx_level >= GFX10) {
       /* Using higher settings on GFX10+ can cause random GPU hangs. */
       settings->context_states_per_bin = 1;
       settings->persistent_states_per_bin = 1;

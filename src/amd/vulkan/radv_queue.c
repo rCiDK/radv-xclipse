@@ -751,24 +751,38 @@ radv_xclipse_allows_clear_state(const struct radv_physical_device *pdev)
 
 /* CB/DB GL2 cache policy. Default: STREAM writes + NOA reads (kernel clearstate). The 530 has one
  * L2 slice (the 920 has four), where no-allocate may behave differently.
- *   RADV_XCLIPSE_CBGL2 / debug.radv_xclipse_cbgl2 = 1 -> cache CB and DB in GL2 (LRU). */
+ *   RADV_XCLIPSE_CBGL2 / debug.radv_xclipse_cbgl2 = 1 -> cache CB in GL2 (LRU).
+ *   RADV_XCLIPSE_DBGL2 / debug.radv_xclipse_dbgl2 = 1 -> cache DB in GL2 (LRU). */
+static bool
+radv_xclipse_gl2_knob(const char *env_name, const char *prop_name, int *cached, const char *label)
+{
+   if (*cached < 0) {
+      const char *e = getenv(env_name);
+      *cached = (e && e[0]) ? (atoi(e) != 0) : 0;
+#ifdef __ANDROID__
+      if (!e || !e[0]) {
+         char v[PROP_VALUE_MAX] = {0};
+         if (__system_property_get(prop_name, v) > 0 && v[0])
+            *cached = atoi(v) != 0;
+      }
+#endif
+      RADV_LOGI("[XCLIPSE] %s=%d", label, *cached);
+   }
+   return *cached == 1;
+}
+
 static bool
 radv_xclipse_cb_gl2(void)
 {
    static int cached = -1;
-   if (cached < 0) {
-      const char *e = getenv("RADV_XCLIPSE_CBGL2");
-      cached = (e && e[0]) ? (atoi(e) != 0) : 0;
-#ifdef __ANDROID__
-      if (!e || !e[0]) {
-         char v[PROP_VALUE_MAX] = {0};
-         if (__system_property_get("debug.radv_xclipse_cbgl2", v) > 0 && v[0])
-            cached = atoi(v) != 0;
-      }
-#endif
-      RADV_LOGI("[XCLIPSE] cache_cb_gl2=%d", cached);
-   }
-   return cached == 1;
+   return radv_xclipse_gl2_knob("RADV_XCLIPSE_CBGL2", "debug.radv_xclipse_cbgl2", &cached, "cache_cb_gl2");
+}
+
+static bool
+radv_xclipse_db_gl2(void)
+{
+   static int cached = -1;
+   return radv_xclipse_gl2_knob("RADV_XCLIPSE_DBGL2", "debug.radv_xclipse_dbgl2", &cached, "cache_db_gl2");
 }
 
 static void
@@ -832,6 +846,22 @@ radv_pack_float_12p4(float x)
    return x <= 0 ? 0 : x >= 4096 ? 0xffff : x * 16;
 }
 
+struct radv_xclipse_ctx_entry {
+   uint32_t remapped_dw;
+   uint32_t orig_reg;
+   uint32_t val;
+};
+
+static int
+radv_xclipse_ctx_entry_cmp(const void *a, const void *b)
+{
+   const struct radv_xclipse_ctx_entry *ea = a;
+   const struct radv_xclipse_ctx_entry *eb = b;
+   if (ea->remapped_dw != eb->remapped_dw)
+      return ea->remapped_dw < eb->remapped_dw ? -1 : 1;
+   return 0;
+}
+
 void
 radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
 {
@@ -862,9 +892,38 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
    }
 
    if (radv_xclipse_needs_ctx_init(pdev)) {
-      /* Ascending order: ac_pm4_set_reg coalesces consecutive registers. */
-      for (unsigned ci = 0; ci < ARRAY_SIZE(ac_xclipse_ctx_init); ci++)
-         ac_pm4_set_reg(pm4, ac_xclipse_ctx_init[ci].reg, ac_xclipse_ctx_init[ci].val);
+      if (ac_titan_regmap_active && ac_titan_preamble_remap()) {
+         /* Sort by post-remap offset so ac_pm4_set_reg coalesces into long runs, and skip
+          * GFX10.3-only CB_COLORi PITCH/SLICE/CMASK/FMASK slots that alias TITAN MRT registers. */
+         struct radv_xclipse_ctx_entry sorted[ARRAY_SIZE(ac_xclipse_ctx_init)];
+         unsigned n = 0;
+         const bool kmap = ac_titan_kmap_level() >= 1;
+
+         for (unsigned ci = 0; ci < ARRAY_SIZE(ac_xclipse_ctx_init); ci++) {
+            const uint32_t reg = ac_xclipse_ctx_init[ci].reg;
+            const uint32_t dw = (reg - SI_CONTEXT_REG_OFFSET) >> 2;
+            if (kmap && dw >= 0x318 && dw < 0x318 + 0x0f * 8) {
+               const uint32_t slot = (dw - 0x318) % 0x0f;
+               if (slot == 1 || slot == 2 || slot == 7 || slot == 8 || slot == 9 || slot == 10)
+                  continue;
+            }
+            sorted[n++] = (struct radv_xclipse_ctx_entry){
+               .remapped_dw = ac_titan_remap_dw_quiet(SI_CONTEXT_REG_OFFSET, dw),
+               .orig_reg = reg,
+               .val = ac_xclipse_ctx_init[ci].val,
+            };
+         }
+         qsort(sorted, n, sizeof(sorted[0]), radv_xclipse_ctx_entry_cmp);
+         for (unsigned ci = 0; ci < n; ci++) {
+            if (ci + 1 < n && sorted[ci].remapped_dw == sorted[ci + 1].remapped_dw)
+               continue;
+            ac_pm4_set_reg(pm4, sorted[ci].orig_reg, sorted[ci].val);
+         }
+      } else {
+         /* Ascending order: ac_pm4_set_reg coalesces consecutive registers. */
+         for (unsigned ci = 0; ci < ARRAY_SIZE(ac_xclipse_ctx_init); ci++)
+            ac_pm4_set_reg(pm4, ac_xclipse_ctx_init[ci].reg, ac_xclipse_ctx_init[ci].val);
+      }
    }
 
    const struct ac_preamble_state preamble_state = {
@@ -872,9 +931,9 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
       .gfx10 =
          {
             /* Xclipse: the kernel clearstate policy (STREAM writes, NOA reads) unless
-             * RADV_XCLIPSE_CBGL2 asks for LRU. */
+             * RADV_XCLIPSE_CBGL2 / RADV_XCLIPSE_DBGL2 asks for LRU. */
             .cache_cb_gl2 = radv_xclipse_cb_gl2(),
-            .cache_db_gl2 = radv_xclipse_cb_gl2(),
+            .cache_db_gl2 = radv_xclipse_db_gl2(),
          },
    };
 

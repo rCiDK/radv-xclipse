@@ -620,11 +620,8 @@ radv_xclipse_ibcache_park(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_wins
       return false;
    }
 
-   /* Drop the CPU mapping so buffer_map() sees a fresh BO. munmap does not touch the GART binding. */
-   if (bo->cpu_map) {
-      munmap(bo->cpu_map, bo->base.size);
-      bo->cpu_map = NULL;
-   }
+   /* Keep cpu_map while parked so reuse avoids GEM_MMAP + mmap; unmapped on eviction in
+    * radv_amdgpu_winsys_bo_destroy(). */
 
    struct radv_xclipse_ibcache_entry *e = &radv_xclipse_ibcache[radv_xclipse_ibcache_count++];
    e->bo = bo;
@@ -638,7 +635,7 @@ radv_xclipse_ibcache_park(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_wins
    return true;
 }
 
-/* Create path: return an exact match (size, alignment, flags, domain) or NULL. */
+/* Create path: return a best-fit match (size <= e->size <= size*2, alignment, flags, domain) or NULL. */
 static struct radv_amdgpu_winsys_bo *
 radv_xclipse_ibcache_reuse(struct radv_amdgpu_winsys *ws, uint64_t size, unsigned alignment,
                            enum radeon_bo_domain domain, uint32_t flags)
@@ -651,15 +648,27 @@ radv_xclipse_ibcache_reuse(struct radv_amdgpu_winsys *ws, uint64_t size, unsigne
       domain = (domain & ~RADEON_DOMAIN_VRAM) | RADEON_DOMAIN_GTT;
 
    struct radv_amdgpu_winsys_bo *bo = NULL;
+   int best_idx = -1;
+   uint64_t best_size = UINT64_MAX;
    simple_mtx_lock(&radv_xclipse_ibcache_lock);
    for (unsigned i = 0; i < radv_xclipse_ibcache_count; i++) {
       struct radv_xclipse_ibcache_entry *e = &radv_xclipse_ibcache[i];
-      if (e->ws != ws || e->size != size || e->alignment != alignment || e->flags != flags || e->domain != domain)
+      if (e->ws != ws || e->size < size || e->size > size * 2 ||
+          e->alignment < alignment || (e->alignment % alignment) != 0 ||
+          e->flags != flags || e->domain != domain)
          continue;
+      if (e->size < best_size) {
+         best_size = e->size;
+         best_idx = (int)i;
+         if (e->size == size)
+            break;
+      }
+   }
+   if (best_idx >= 0) {
+      struct radv_xclipse_ibcache_entry *e = &radv_xclipse_ibcache[best_idx];
       bo = e->bo;
       radv_xclipse_ibcache_bytes -= e->size;
-      radv_xclipse_ibcache[i] = radv_xclipse_ibcache[--radv_xclipse_ibcache_count];
-      break;
+      radv_xclipse_ibcache[best_idx] = radv_xclipse_ibcache[--radv_xclipse_ibcache_count];
    }
    simple_mtx_unlock(&radv_xclipse_ibcache_lock);
    return bo;

@@ -529,8 +529,13 @@ gfx10_init_graphics_preamble_state(const struct ac_preamble_state *state,
        */
       zs_write_policy = V_02807C_CACHE_STREAM;
       zs_read_policy = cache_no_alloc;
-      htile_write_policy = V_02807C_CACHE_STREAM;
-      htile_read_policy = cache_no_alloc;
+      if (info->xclipse_model != AC_XCLIPSE_NONE) {
+         htile_write_policy = V_028410_CACHE_LRU_WR;
+         htile_read_policy = V_028410_CACHE_LRU_RD;
+      } else {
+         htile_write_policy = V_02807C_CACHE_STREAM;
+         htile_read_policy = cache_no_alloc;
+      }
    }
 
    const unsigned cu_mask_ps = info->gfx_level >= GFX10_3 ? ac_gfx103_get_cu_mask_ps(info) : ~0u;

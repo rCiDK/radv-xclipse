@@ -30,8 +30,39 @@ int ac_titan_cb_ext_slot = -1;
 int ac_titan_cb_view_slot = -1;
 uint32_t ac_titan_regmap_hits = 0;
 
-#define AC_TITAN_CTX_DWORDS ((SI_CONTEXT_REG_END - SI_CONTEXT_REG_OFFSET) / 4)
-#define AC_TITAN_SH_DWORDS  ((SI_SH_REG_END - SI_SH_REG_OFFSET) / 4)
+uint16_t ac_titan_ctx_lut[AC_TITAN_CTX_DWORDS];
+uint8_t ac_titan_ctx_run[AC_TITAN_CTX_DWORDS];
+uint16_t ac_titan_sh_lut[AC_TITAN_SH_DWORDS];
+uint8_t ac_titan_sh_run[AC_TITAN_SH_DWORDS];
+bool ac_titan_ucfg_active = false;
+
+static void
+ac_titan_build_luts(void)
+{
+   for (uint32_t dw = 0; dw < AC_TITAN_CTX_DWORDS; dw++)
+      ac_titan_ctx_lut[dw] = (uint16_t)ac_titan_ctx_dw_compute(dw);
+
+   ac_titan_ctx_run[AC_TITAN_CTX_DWORDS - 1] = 1;
+   for (int i = (int)AC_TITAN_CTX_DWORDS - 2; i >= 0; i--) {
+      if (ac_titan_ctx_lut[i + 1] == ac_titan_ctx_lut[i] + 1)
+         ac_titan_ctx_run[i] = ac_titan_ctx_run[i + 1] < 255 ? ac_titan_ctx_run[i + 1] + 1 : 255;
+      else
+         ac_titan_ctx_run[i] = 1;
+   }
+
+   for (uint32_t dw = 0; dw < AC_TITAN_SH_DWORDS; dw++)
+      ac_titan_sh_lut[dw] = (uint16_t)ac_titan_sh_dw_compute(dw);
+
+   ac_titan_sh_run[AC_TITAN_SH_DWORDS - 1] = 1;
+   for (int i = (int)AC_TITAN_SH_DWORDS - 2; i >= 0; i--) {
+      if (ac_titan_sh_lut[i + 1] == ac_titan_sh_lut[i] + 1)
+         ac_titan_sh_run[i] = ac_titan_sh_run[i + 1] < 255 ? ac_titan_sh_run[i + 1] + 1 : 255;
+      else
+         ac_titan_sh_run[i] = 1;
+   }
+
+   ac_titan_ucfg_active = ac_titan_kmap_level() >= 3;
+}
 
 /* Two kinds of collision:
  *   MOVED x MOVED    two entries land on the same destination: a table bug, fatal.
@@ -164,6 +195,9 @@ ac_titan_regmap_set_level(uint32_t level)
    /* Parse overrides before validating too; a colliding override is refused like a bad table. */
    ac_titan_mapovr_parse();
 
+   /* Build flat LUTs and max-contiguous-run tables once for O(1) remap and run-split. */
+   ac_titan_build_luts();
+
    /* Refuse rather than half-apply: a colliding table is worse than no remap. */
    if (level > 0 && !ac_titan_regmap_validate()) {
       RADV_LOGI("[XCLIPSE] TITAN regmap REFUSED -- fix the table above; running unmapped");
@@ -224,16 +258,21 @@ static const struct ac_xclipse_chip ac_xclipse_chips[AC_XCLIPSE_MODEL_COUNT] = {
                            {64, 3, 8, 0x03ff0154, 0x00c00000, true}},
    [AC_XCLIPSE_530]     = {"530",     "TITAN",         true,  false, true,   false, false, false,
                            {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
-   [AC_XCLIPSE_940]     = {"940",     "MAGELLAN CARL", true,  true,  true,   true,  false, false},
-   [AC_XCLIPSE_540]     = {"540",     "ARIEL",         true,  false, true,   true,  false, false},
+   [AC_XCLIPSE_940]     = {"940",     "MAGELLAN CARL", true,  true,  true,   true,  false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, true}},
+   [AC_XCLIPSE_540]     = {"540",     "ARIEL",         true,  false, true,   true,  false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
    /* The 950's early vsprobe timeouts and the 960's draw timeouts were mid-IB preemption with
     * register shadowing, now off on every Xclipse (see has_kernelq_reg_shadowing). The 950's BVH
     * build hang predates that and is untested since. */
-   [AC_XCLIPSE_950]     = {"950",     "GALILEO",       true,  true,  true,   true,  false, false},
-   [AC_XCLIPSE_960]     = {"960",     "JUNO",          true,  true,  true,   true,  false, false},
+   [AC_XCLIPSE_950]     = {"950",     "GALILEO",       true,  true,  true,   true,  false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
+   [AC_XCLIPSE_960]     = {"960",     "JUNO",          true,  true,  true,   true,  false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
    /* The 550 is the 540 one generation on: no RT (its vendor driver exposes none), and like the
     * other TITAN-map chips no CP DMA prefetch. */
-   [AC_XCLIPSE_550]     = {"550",     "TRITON",        true,  false, true,   true,  false, false},
+   [AC_XCLIPSE_550]     = {"550",     "TRITON",        true,  false, true,   true,  false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
    [AC_XCLIPSE_UNKNOWN] = {"unknown", NULL,            false, true,  false,  false, false, false},
 };
 
@@ -2107,6 +2146,9 @@ void ac_fill_hw_info(struct radeon_info *info, const struct drm_amdgpu_info_devi
       default:
          assert(0);
       }
+
+      if (info->xclipse_model != AC_XCLIPSE_NONE)
+         pc_lines = 1024;
 
       info->pc_lines = pc_lines;
 

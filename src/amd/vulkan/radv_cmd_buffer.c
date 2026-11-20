@@ -5193,36 +5193,54 @@ radv_gfx6_emit_fb_color_state(struct radv_cmd_buffer *cmd_buffer, int index, con
    radeon_begin(cmd_buffer->cs);
 
    if (ac_titan_regmap_level >= 9) {
-      /* TITAN's per-MRT block is 9 dwords, not 15, and CB_COLORi_INFO lives elsewhere, so this
-       * cannot be a run. Written individually through the map. CB_COLORi_ATTRIB carries the
-       * sample and fragment counts: without it a multisampled target renders wrong (radeonsi's
-       * MSAA probe on the 530). */
-      radeon_set_context_reg(R_028C60_CB_COLOR0_BASE + index * 0x3c, cb->ac.cb_color_base);
-      radeon_set_context_reg(R_028C70_CB_COLOR0_INFO + index * 0x3c, cb_color_info);
-      radeon_set_context_reg(R_028C74_CB_COLOR0_ATTRIB + index * 0x3c, cb->ac.cb_color_attrib);
-      radeon_set_context_reg(R_028EC0_CB_COLOR0_ATTRIB2 + index * 4, cb->ac.cb_color_attrib2);
-      radeon_set_context_reg(R_028EE0_CB_COLOR0_ATTRIB3 + index * 4, cb->ac.cb_color_attrib3);
+      if (ac_titan_kmap_level() >= 1 && ac_titan_cb_view_slot > 0 && pdev->xclipse_dcc) {
+         /* TITAN's 9-dword per-MRT block (0x318 + 9*i): slots 0-3 (BASE, VIEW, ATTRIB, DCC_CONTROL)
+          * and slots 6-8 (DCC_BASE, ATTRIB2, ATTRIB3) are contiguous. */
+         radeon_set_context_reg_seq(R_028C60_CB_COLOR0_BASE + index * 0x3c, 4);
+         radeon_emit(cb->ac.cb_color_base);
+         radeon_emit(cb->ac.cb_color_view);
+         radeon_emit(cb->ac.cb_color_attrib);
+         radeon_emit(cb->ac.cb_dcc_control);
 
-      /* DCC (RADV_XCLIPSE_DCC): control and metadata address, through the map like the rest. */
-      if (pdev->xclipse_dcc) {
-         radeon_set_context_reg(R_028C78_CB_COLOR0_DCC_CONTROL + index * 0x3c, cb->ac.cb_dcc_control);
-         radeon_set_context_reg(R_028C94_CB_COLOR0_DCC_BASE + index * 0x3c, cb->ac.cb_dcc_base);
+         radeon_set_context_reg_seq(R_028C94_CB_COLOR0_DCC_BASE + index * 0x3c, 3);
+         radeon_emit(cb->ac.cb_dcc_base);
+         radeon_emit(cb->ac.cb_color_attrib2);
+         radeon_emit(cb->ac.cb_color_attrib3);
+
+         radeon_set_context_reg(R_028C70_CB_COLOR0_INFO + index * 0x3c, cb_color_info);
          radeon_set_context_reg(R_028EA0_CB_COLOR0_DCC_BASE_EXT + index * 4,
                                 S_028EA0_BASE_256B(cb->ac.cb_dcc_base >> 32));
-      }
+      } else if (ac_titan_kmap_level() >= 1 && ac_titan_cb_view_slot > 0) {
+         /* Slots 0-2 (BASE, VIEW, ATTRIB) and slots 7-8 (ATTRIB2, ATTRIB3) are contiguous. */
+         radeon_set_context_reg_seq(R_028C60_CB_COLOR0_BASE + index * 0x3c, 3);
+         radeon_emit(cb->ac.cb_color_base);
+         radeon_emit(cb->ac.cb_color_view);
+         radeon_emit(cb->ac.cb_color_attrib);
 
-      /* CB_COLORi_VIEW (SLICE_START, SLICE_MAX, MIP_LEVEL): without it every write lands on
-       * layer 0 of level 0. Written through GFX10_3's register so the kernel map places it
-       * (TITAN 0x319 + 9i, the vendor's slot and GFX10's field layout, both measured).
-       *
-       * It used to be written at a raw TITAN offset, 0x318 + 9i + slot, which the map then
-       * translated AGAIN as if it were a GFX10_3 offset. That happens to land right for MRT 0, 1,
-       * 5 and 6, but MRT 2's view went into MRT 1's CB_COLOR1_INFO, MRT 3's into CB_COLOR1_DCC_BASE,
-       * MRT 4's into CB_COLOR2_CMASK and MRT 7's into CB_COLOR4_INFO -- which is how a register
-       * that fixed every single-target probe cost a real game 25x its frame rate.
-       * RADV_XCLIPSE_TITAN_CBVIEW=0 leaves it unwritten. */
-      if (ac_titan_cb_view_slot > 0)
-         radeon_set_context_reg(R_028C6C_CB_COLOR0_VIEW + index * 0x3c, cb->ac.cb_color_view);
+         radeon_set_context_reg_seq(R_028EC0_CB_COLOR0_ATTRIB2 + index * 4, 2);
+         radeon_emit(cb->ac.cb_color_attrib2);
+         radeon_emit(cb->ac.cb_color_attrib3);
+
+         radeon_set_context_reg(R_028C70_CB_COLOR0_INFO + index * 0x3c, cb_color_info);
+      } else {
+         /* Fallback when VIEW is disabled or using the hand-recovered map (kmap_level == 0). */
+         radeon_set_context_reg(R_028C60_CB_COLOR0_BASE + index * 0x3c, cb->ac.cb_color_base);
+         radeon_set_context_reg(R_028C70_CB_COLOR0_INFO + index * 0x3c, cb_color_info);
+         radeon_set_context_reg(R_028C74_CB_COLOR0_ATTRIB + index * 0x3c, cb->ac.cb_color_attrib);
+         radeon_set_context_reg(R_028EC0_CB_COLOR0_ATTRIB2 + index * 4, cb->ac.cb_color_attrib2);
+         radeon_set_context_reg(R_028EE0_CB_COLOR0_ATTRIB3 + index * 4, cb->ac.cb_color_attrib3);
+
+         /* DCC (RADV_XCLIPSE_DCC): control and metadata address, through the map like the rest. */
+         if (pdev->xclipse_dcc) {
+            radeon_set_context_reg(R_028C78_CB_COLOR0_DCC_CONTROL + index * 0x3c, cb->ac.cb_dcc_control);
+            radeon_set_context_reg(R_028C94_CB_COLOR0_DCC_BASE + index * 0x3c, cb->ac.cb_dcc_base);
+            radeon_set_context_reg(R_028EA0_CB_COLOR0_DCC_BASE_EXT + index * 4,
+                                   S_028EA0_BASE_256B(cb->ac.cb_dcc_base >> 32));
+         }
+
+         if (ac_titan_cb_view_slot > 0)
+            radeon_set_context_reg(R_028C6C_CB_COLOR0_VIEW + index * 0x3c, cb->ac.cb_color_view);
+      }
 
       /* Colour target address high half. RADV's targets sit above the 40-bit boundary, and the
        * 530's PAL (low surfaces) never reveals where TITAN keeps it. Default is GFX10_3's 0x028E40;

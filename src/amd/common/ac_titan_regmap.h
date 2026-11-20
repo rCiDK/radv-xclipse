@@ -29,10 +29,20 @@
 
 #include "sid.h"
 #include "ac_titan_kmap.h"
+#include "ac_xclipse_log.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define AC_TITAN_CTX_DWORDS ((SI_CONTEXT_REG_END - SI_CONTEXT_REG_OFFSET) / 4)
+#define AC_TITAN_SH_DWORDS  ((SI_SH_REG_END - SI_SH_REG_OFFSET) / 4)
+
+extern uint16_t ac_titan_ctx_lut[AC_TITAN_CTX_DWORDS];
+extern uint8_t ac_titan_ctx_run[AC_TITAN_CTX_DWORDS];
+extern uint16_t ac_titan_sh_lut[AC_TITAN_SH_DWORDS];
+extern uint8_t ac_titan_sh_run[AC_TITAN_SH_DWORDS];
+extern bool ac_titan_ucfg_active;
 
 int ac_xclipse_runcheck(void);
 
@@ -159,7 +169,7 @@ extern uint32_t ac_titan_mapovr_dst[AC_TITAN_MAPOVR_MAX];
 void ac_titan_mapovr_parse(void);
 
 static inline uint32_t
-ac_titan_ctx_dw(uint32_t dw)
+ac_titan_ctx_dw_compute(uint32_t dw)
 {
    /* Environment override first. */
    for (int __i = 0; __i < ac_titan_mapovr_n; __i++)
@@ -347,7 +357,7 @@ ac_titan_ctx_dw(uint32_t dw)
 }
 
 static inline uint32_t
-ac_titan_sh_dw(uint32_t dw)
+ac_titan_sh_dw_compute(uint32_t dw)
 {
    if (ac_titan_kmap_level() >= 2)
       return ac_titan_kmap_sh(dw);
@@ -405,6 +415,18 @@ ac_titan_preamble_remap(void)
    return cached != 0;
 }
 
+static inline uint32_t
+ac_titan_ctx_dw(uint32_t dw)
+{
+   return dw < AC_TITAN_CTX_DWORDS ? ac_titan_ctx_lut[dw] : dw;
+}
+
+static inline uint32_t
+ac_titan_sh_dw(uint32_t dw)
+{
+   return dw < AC_TITAN_SH_DWORDS ? ac_titan_sh_lut[dw] : dw;
+}
+
 /* Same mapping without touching ac_titan_regmap_hits, so the run checker does not perturb it. */
 static inline uint32_t
 ac_titan_remap_dw_quiet(uint32_t base, uint32_t dw)
@@ -415,7 +437,7 @@ ac_titan_remap_dw_quiet(uint32_t base, uint32_t dw)
       return ac_titan_ctx_dw(dw);
    if (base == SI_SH_REG_OFFSET)
       return ac_titan_sh_dw(dw);
-   if (base == CIK_UCONFIG_REG_OFFSET && ac_titan_kmap_level() >= 3)
+   if (base == CIK_UCONFIG_REG_OFFSET && ac_titan_ucfg_active)
       return ac_titan_kmap_ucfg(dw);
    return dw;
 }
@@ -424,8 +446,12 @@ ac_titan_remap_dw_quiet(uint32_t base, uint32_t dw)
 static inline bool
 ac_titan_run_split(uint32_t base, uint32_t dw, uint32_t num)
 {
-   if (!ac_titan_regmap_active)
+   if (!ac_titan_regmap_active || num <= 1)
       return false;
+   if (base == SI_CONTEXT_REG_OFFSET && dw < AC_TITAN_CTX_DWORDS && num <= 255)
+      return num > ac_titan_ctx_run[dw];
+   if (base == SI_SH_REG_OFFSET && dw < AC_TITAN_SH_DWORDS && num <= 255)
+      return num > ac_titan_sh_run[dw];
    const uint32_t d0 = ac_titan_remap_dw_quiet(base, dw);
    for (uint32_t k = 1; k < num; k++)
       if (ac_titan_remap_dw_quiet(base, dw + k) != d0 + k)
@@ -447,10 +473,10 @@ ac_titan_remap_dw(uint32_t base, uint32_t dw)
       out = ac_titan_ctx_dw(dw);
    else if (base == SI_SH_REG_OFFSET)
       out = ac_titan_sh_dw(dw);
-   else if (base == CIK_UCONFIG_REG_OFFSET && ac_titan_kmap_level() >= 3)
+   else if (base == CIK_UCONFIG_REG_OFFSET && ac_titan_ucfg_active)
       out = ac_titan_kmap_ucfg(dw);
 
-   if (out != dw)
+   if (ac_xclipse_log_level() >= 1 && out != dw)
       ac_titan_regmap_hits++;
    return out;
 }
@@ -473,9 +499,19 @@ ac_titan_check_run(uint32_t base, uint32_t dw, uint32_t num)
       return;
 
    /* Deliberate reshapes: the viewport array at PA_CL_VPORT_XSCALE is emitted GFX12-style on
-    * TITAN (see radv_emit_viewport). Keep this list tiny. */
+    * TITAN (see radv_emit_viewport), and per-MRT color state coalesces into TITAN's 9-dword MRT
+    * block (see radv_emit_fb_color_state). Keep this list tiny. */
    if (base == SI_CONTEXT_REG_OFFSET && dw == 0x10f)
       return;
+   if (base == SI_CONTEXT_REG_OFFSET && ac_titan_regmap_level >= 9 && ac_titan_kmap_level() >= 1) {
+      if (dw >= 0x318 && dw < 0x318 + 0x0f * 8) {
+         const uint32_t slot = (dw - 0x318) % 0x0f;
+         if (slot == 0 || slot == 2 || slot == 13)
+            return;
+      }
+      if (dw >= 0x3b0 && dw < 0x3b8 && num == 2)
+         return;
+   }
 
    const uint32_t d0 = ac_titan_remap_dw_quiet(base, dw);
    for (uint32_t k = 1; k < num; k++) {
